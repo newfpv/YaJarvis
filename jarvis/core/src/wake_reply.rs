@@ -220,6 +220,7 @@ impl Engine {
                     phrase,
                     Duration::from_secs(10),
                     cancelled,
+                    false,
                 )?;
                 let bytes = if short_enough(&sample) {
                     recorded += 1;

@@ -70,12 +70,46 @@ export async function api(method, url, body, { signal } = {}) {
   return d;
 }
 
-export function toast(msg, bad = false) {
-  const t = $("#toast");
-  t.textContent = msg;
-  t.className = "toast show" + (bad ? " bad" : "");
+let toastSequence = 0;
+
+function displayToast(message, bad, duration) {
+  const element = $("#toast");
+  if (!element) return null;
+  const sequence = ++toastSequence;
+  element.textContent = message;
+  element.className = "toast show" + (bad ? " bad" : "");
   clearTimeout(toast.t);
-  toast.t = setTimeout(() => (t.className = "toast"), bad ? 4500 : 2200);
+  if (duration > 0) {
+    toast.t = setTimeout(() => {
+      if (sequence === toastSequence) element.className = "toast";
+    }, duration);
+  }
+  return { element, sequence };
+}
+
+export function toast(msg, bad = false) {
+  displayToast(msg, bad, bad ? 4500 : 2200);
+}
+
+// Long-running operations use the existing floating notification without blocking
+// other page messages. A stale operation cannot overwrite a newer toast.
+export function toastProgress(message) {
+  const current = displayToast(message, false, 0);
+  const ownsToast = () => current && current.sequence === toastSequence;
+  return {
+    update(text) {
+      if (ownsToast()) current.element.textContent = text;
+    },
+    finish(text, bad = false) {
+      if (ownsToast()) toast(text, bad);
+    },
+    clear() {
+      if (!ownsToast()) return;
+      ++toastSequence;
+      clearTimeout(toast.t);
+      current.element.className = "toast";
+    },
+  };
 }
 export async function act(btn, fn, okMsg) {
   if (btn) btn.disabled = true;

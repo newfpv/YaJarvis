@@ -11,7 +11,7 @@
 <script>
   import { onMount, untrack } from "svelte";
   import { SvelteMap } from "svelte/reactivity";
-  import { api, icon, tip, toast } from "#helpers/core.js";
+  import { api, icon, tip, toast, toastProgress } from "#helpers/core.js";
   import { reload, S } from "#state/panelState.js";
   import styles from "./ProfileVoice.module.css";
 
@@ -31,7 +31,18 @@
   let elevenLoading = $state(false);
   let elevenError = $state("");
   let previewVoice = $state(null);
+  let previewPhase = $state("");
   let previewRequest;
+  let previewTimer;
+  let previewProgressToast;
+  const phaseLabels = {
+    queued: "Ожидание предыдущей пробы…",
+    checking_speaker: "Проверяю, свободна ли колонка…",
+    checking_cache: "Проверяю сохранённый образец…",
+    connecting: "Подключаю голосовой движок…",
+    generating: "Генерирую образец — это может занять до 25 секунд…",
+    playing: "Воспроизвожу на колонке…",
+  };
   let name = $state("");
   let prompt = $state("");
   let savingVoice = $state(false);
@@ -50,12 +61,21 @@
   onMount(() => () => {
     controller.abort();
     previewRequest?.abort();
+    clearInterval(previewTimer);
+    previewProgressToast?.clear();
+    previewPhase = "";
+    if (previewRequest) void api("POST", "/api/preview/cancel", {}).catch(() => {});
   });
 
   export function configure(nextEngine, provider, available, optionsExist) {
     if (engine !== nextEngine || ttsProvider !== provider || !available) {
       previewRequest?.abort();
+      if (previewRequest) void api("POST", "/api/preview/cancel", {}).catch(() => {});
+      clearInterval(previewTimer);
+      previewProgressToast?.clear();
+      previewProgressToast = undefined;
       previewVoice = null;
+      previewPhase = "";
     }
     engine = nextEngine;
     ttsProvider = provider;
@@ -131,20 +151,52 @@
     }
   }
 
-  async function preview(id, trigger = id) {
+  async function preview(id, trigger = id, label = id) {
     previewRequest?.abort();
+    previewProgressToast?.clear();
+    clearInterval(previewTimer);
     const request = new AbortController();
+    const notice = toastProgress(`${label}: ${phaseLabels.queued}`);
     previewRequest = request;
+    previewProgressToast = notice;
     previewVoice = trigger;
+    previewPhase = "queued";
+    let lastPhase = "queued";
     try {
+      // Aborting fetch alone does not stop generation on the speaker.
+      await api("POST", "/api/preview/cancel", {}, { signal: request.signal });
+      if (request.signal.aborted) return;
+      let polling = false;
+      const poll = async () => {
+        if (polling || request.signal.aborted || previewRequest !== request) return;
+        polling = true;
+        try {
+          const status = await api("GET", "/api/preview/status", undefined, { signal: request.signal });
+          if (previewRequest === request && status.voice === id && phaseLabels[status.phase]
+              && status.phase !== lastPhase) {
+            lastPhase = status.phase;
+            previewPhase = status.phase;
+            notice.update(`${label}: ${phaseLabels[status.phase]}`);
+          }
+        } catch { /* The main preview request shows any actionable error. */ }
+        finally { polling = false; }
+      };
+      previewTimer = setInterval(poll, 350);
       const response = await api("POST", "/api/preview", { voice: id, engine, ...previewModels(engine) }, { signal: request.signal });
-      if (!response.interrupted) toast("Образец прозвучал на колонке");
+      if (previewRequest === request && !response.interrupted) {
+        notice.finish(response.cached ? "Образец из кеша прозвучал на колонке" : "Голос записан в кеш и прозвучал на колонке");
+      }
     } catch (error) {
-      if (!request.signal.aborted) toast(error.message, true);
+      if (!request.signal.aborted && previewRequest === request) notice.finish(error.message, true);
     } finally {
       if (previewRequest === request) {
+        clearInterval(previewTimer);
+        previewTimer = undefined;
         previewRequest = undefined;
+        previewProgressToast = undefined;
         previewVoice = null;
+        previewPhase = "";
+        notice.clear();
       }
     }
   }
@@ -208,9 +260,17 @@
           aria-pressed={selected === item.id} onclick={() => choose(item.id)}>
           <b>{item.name}</b><small>{item.note || ""}</small>
         </button>
-        <button class="ib {styles.action}" type="button" data-play={item.id} title="Послушать на колонке"
-          aria-label={"Послушать голос " + item.name} disabled={previewVoice === item.id} onclick={() => preview(item.id)}>
-          {@html icon("play", "solid")}
+        <button class="ib {styles.action}" type="button" data-play={item.id}
+          title={previewVoice === item.id ? (previewPhase === "playing" ? "Говорит на колонке" : "Готовлю образец на колонке…") : "Послушать на колонке"}
+          aria-label={previewVoice === item.id ? (previewPhase === "playing" ? "Воспроизводится голос " : "Готовится голос ") + item.name : "Послушать голос " + item.name} aria-busy={previewVoice === item.id}
+          disabled={previewVoice === item.id} onclick={() => preview(item.id, item.id, item.name)}>
+          {#if previewVoice === item.id && previewPhase === "playing"}
+            <span class={styles.equalizer} aria-hidden="true"><i></i><i></i><i></i></span>
+          {:else if previewVoice === item.id}
+            <span class={styles.spinner} aria-hidden="true"></span>
+          {:else}
+            {@html icon("play", "solid")}
+          {/if}
         </button>
         {#if item.custom}
           <button class="ib {styles.action}" type="button" data-delv={item.id} title="Удалить голос"
@@ -269,8 +329,16 @@
             placeholder="Например, голос из плагина" autocomplete="off"
             oninput={(event) => choose(event.currentTarget.value.trim())}>
         </div>
-        <button class="btn" id="p-tts-voice-test" type="button" disabled={previewVoice === manualPreview}
-          onclick={() => preview(draft.ttsVoice, manualPreview)}>Послушать</button>
+        <button class="btn" id="p-tts-voice-test" type="button" aria-busy={previewVoice === manualPreview}
+          disabled={previewVoice === manualPreview}
+          onclick={() => preview(draft.ttsVoice, manualPreview, draft.ttsVoice)}>
+          {#if previewVoice === manualPreview && previewPhase === "playing"}
+            <span class={styles.equalizer} aria-hidden="true"><i></i><i></i><i></i></span>
+          {:else if previewVoice === manualPreview}
+            <span class={styles.spinner} aria-hidden="true"></span>
+          {/if}
+          Послушать
+        </button>
       </div>
     {/if}
     <details id="v-custom" class:hidden={!ready || engine !== "openai"}>

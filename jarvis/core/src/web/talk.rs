@@ -15,6 +15,15 @@ pub async fn preview(
         Err(error) => super::bad(error),
     }
 }
+pub async fn preview_status(State(app): State<App>) -> Response {
+    reply(StatusCode::OK, app.engine.preview_status())
+}
+
+pub async fn preview_cancel(State(app): State<App>) -> Response {
+    app.engine.preview_cancel();
+    ok()
+}
+
 pub async fn say(State(app):State<App>,axum::Json(value):axum::Json<serde_json::Value>)->Response {
     let Some(text)=value["text"].as_str().map(str::trim).filter(|t|!t.is_empty() && t.len()<=16000)else{return super::bad("Текст: от 1 до 16000 байт");};
     let text=text.to_string();let speak=value["speak"].as_bool().unwrap_or(true);let engine=app.engine.clone();

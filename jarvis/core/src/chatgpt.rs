@@ -31,7 +31,24 @@ const LIVE_MODEL: &str = "GPT-Live по подписке";
 pub static LIMITED_UNTIL: AtomicI64 = AtomicI64::new(0);
 /// Сколько звука микрофона (16 кГц) уходит плагину за такт 20 мс.
 const FEED_MAX: usize = 3200;
-const PRE_SPEECH_CAP: usize = 5120;
+const PRE_SPEECH_CAP: usize = 12800;
+
+/// Обрезать только ведущую тишину до подключения WebRTC, оставляя минимум `keep` сэмплов
+/// и никогда не выкидывая кадры громче `quiet_amp` (тихая речь издалека).
+fn trim_pre_connect_silence(pending: &mut Vec<i16>, quiet_amp: u16, keep: usize) {
+    const FRAME: usize = 320;
+    let mut drop_n = 0;
+    while pending.len().saturating_sub(drop_n) >= keep + FRAME
+        && pending[drop_n..drop_n + FRAME]
+            .iter()
+            .all(|v| v.unsigned_abs() <= quiet_amp)
+    {
+        drop_n += FRAME;
+    }
+    if drop_n > 0 {
+        pending.drain(..drop_n);
+    }
+}
 
 fn unix() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
@@ -165,12 +182,12 @@ impl ChatGptSession {
         // `closed` may arrive immediately before the actual connection error.
         let res = await_open(open,&self.wake).await;
         let ok = res.is_ok();
+        let threshold = quiet_threshold(self.mic_boost_db);
         if ok {
             let queued_samples = {
                 let mut pending = self.pending.lock().unwrap();
-                if !self.dialog.heard_input_since(self.created) && pending.len() > 2560 {
-                    let drop_n = pending.len() - 2560;
-                    pending.drain(..drop_n);
+                if !self.dialog.heard_input_since(self.created) {
+                    trim_pre_connect_silence(&mut pending, threshold, 2560);
                 }
                 pending.len()
             };
@@ -182,7 +199,6 @@ impl ChatGptSession {
             );
         }
         let _ = started.send(res);
-        let threshold = quiet_threshold(self.mic_boost_db);
         let mut tick = tokio::time::interval(Duration::from_millis(20));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         while ok && !self.cancelled.load(Ordering::SeqCst) {
@@ -260,9 +276,8 @@ impl Session for ChatGptSession {
         }
         let mut pending = self.pending.lock().unwrap();
         queue_mic(&mut pending, pcm);
-        if !self.connected.load(Ordering::Acquire) && !self.dialog.heard_input_since(self.created) && pending.len() > PRE_SPEECH_CAP {
-            let drop_n = pending.len() - PRE_SPEECH_CAP;
-            pending.drain(..drop_n);
+        if !self.connected.load(Ordering::Acquire) && !self.dialog.heard_input_since(self.created) {
+            trim_pre_connect_silence(&mut pending, quiet_threshold(self.mic_boost_db), PRE_SPEECH_CAP);
         }
     }
     fn take_audio(&self) -> Option<Receiver<Vec<i16>>> {
@@ -307,6 +322,7 @@ pub fn module_voice_event(p: Value) {
     }
     let text = value.as_str().unwrap_or("");
     match kind {
+        "speech_started" => s.dialog.heard_input(Instant::now()),
         "user" => s.dialog.on_user(text),
         "bot" => s.dialog.on_bot(text),
         "heard" => {
@@ -534,5 +550,12 @@ mod tests {
             let _ = std::fs::remove_dir_all(dir);
         });
         let _ = sess;
+
+        // Тихая речь (> quiet_threshold) не вырезается при подключении, а ведущая тишина перед ней — обрезается.
+        let mut pending = vec![30i16; 16_000];
+        pending.extend(vec![110i16; 6_400]);
+        super::trim_pre_connect_silence(&mut pending, super::quiet_threshold(0), 2560);
+        assert_eq!(pending.len(), 6_400);
+        assert!(pending.iter().all(|&v| v == 110));
     }
 }

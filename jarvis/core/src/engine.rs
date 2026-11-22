@@ -128,20 +128,47 @@ pub fn loud(pcm: &[i16]) -> bool {
 
 struct InputActivity {
     background: f32,
+    sustained: u32,
+}
+
+impl Default for InputActivity {
+    fn default() -> Self {
+        Self { background: 24.0, sustained: 0 }
+    }
 }
 
 impl InputActivity {
-    fn observe(&mut self, pcm: &[i16], listening: bool) -> bool {
+    fn observe(&mut self, pcm: &[i16], listening: bool, boost_db: i64) -> bool {
+        const SUSTAINED_NOISE_FRAMES: u32 = 200; // 4.0 с непрерывного фона без пауз (слово «Джарвис» ~0.7 с)
+        let scale = if boost_db > 0 {
+            10f32.powf(boost_db.min(24) as f32 / 20.0)
+        } else {
+            1.0
+        };
+        let min_level = (28.0 / scale).max(8.0);
+        let min_sample = (75.0 / scale).max(20.0);
         let mut active = false;
         for frame in pcm.chunks(RATE / 50).filter(|frame| frame.len() >= RATE / 250) {
             let level = frame.iter().map(|v| u32::from(v.unsigned_abs())).sum::<u32>() as f32 / frame.len() as f32;
-            let threshold = (self.background * 2.8).max(140.0) as u16;
-            let speech = level > (self.background * 2.25).max(50.0)
-                && frame.iter().filter(|v| v.unsigned_abs() > threshold).count() >= frame.len() / 8;
-            if !speech || !listening {
-                // Learn the room's background without absorbing sustained speech into it.
-                let step = (level - self.background).clamp(-self.background, self.background.max(20.0));
-                self.background += step * 0.05;
+            let level_threshold = (self.background * 1.8).max(min_level);
+            let sample_threshold = (self.background * 2.2).max(min_sample) as u16;
+            let speech = level > level_threshold
+                && frame.iter().filter(|v| v.unsigned_abs() > sample_threshold).count() >= frame.len() / 12;
+            if !speech {
+                self.sustained = 0;
+                let rate = if level < self.background { 0.08 } else { 0.02 };
+                let step = (level - self.background).clamp(-self.background, self.background.max(12.0));
+                self.background = (self.background + step * rate).max(4.0);
+            } else if !listening {
+                // Не даём слову активации и короткой речи в комнате задирать фоновый порог,
+                // но если шум держится непрерывно >4 с (вентилятор/вытяжка), плавно подстраиваемся.
+                self.sustained = self.sustained.saturating_add(1);
+                if self.sustained > SUSTAINED_NOISE_FRAMES {
+                    let step = (level - self.background).clamp(0.0, self.background.max(20.0));
+                    self.background += step * 0.02;
+                }
+            } else {
+                self.sustained = 0;
             }
             active |= speech;
         }
@@ -346,7 +373,7 @@ impl Engine {
             .spawn(move || {
                 let (_, rx) = e.mic.subscribe(256);
                 let mut batch = crate::training_io::AudioBatch::default();
-                let mut activity = InputActivity { background: 24.0 };
+                let mut activity = InputActivity::default();
                 for raw in rx {
                     let training_enabled = e.host.wake_training();
                     if let Some(replacement)=e.listener.take_reload(&e.data,&e.store,training_enabled){det=replacement;}
@@ -381,7 +408,8 @@ impl Engine {
                         );
                         (st.live.clone(), st.busy, st.echo.muted(now), input)
                     };
-                    if !muted_input && activity.observe(&input, busy) {
+                    let boost_db = e.store.mic_boost_db();
+                    if !muted_input && activity.observe(&input, busy, boost_db) {
                         let now = Instant::now();
                         e.st.lock().unwrap().input_at = Some(now);
                         if let Some(session) = &live {
@@ -402,7 +430,6 @@ impl Engine {
                         det.reset();
                     }
                     let enabled = e.store.wake_enabled() && !e.recording_word.load(Ordering::Acquire);
-                    let boost_db = e.store.mic_boost_db();
                     let ready = e.listener.ready.load(Ordering::Relaxed);
                     let hit = ready && enabled && det.feed(&raw); // поток признаков непрерывный, и во время разговора
                     let prob = det.last_prob();
@@ -810,7 +837,7 @@ impl Engine {
                 if reply.is_none() {
                     let mut first = preroll[before..].to_vec();
                     first.extend_from_slice(&st.hold);
-                    if st.input_at.is_some_and(|at| at + Duration::from_millis(200) >= opening_at) {
+                    if st.input_at.is_some_and(|at| at >= opening_at) {
                         x.dialog().heard_input(Instant::now());
                     }
                     x.feed(&boost(&first, s.mic_boost_db));
@@ -1272,22 +1299,61 @@ mod tests {
 
     #[test]
     fn input_activity_detects_quiet_speech_and_ignores_ambient_noise_and_spikes() {
-        let mut detector = super::InputActivity { background: 24.0 };
+        let mut detector = super::InputActivity::default();
         let background: Vec<i16> = (0..320).map(|i| if i % 2 == 0 { 36 } else { -36 }).collect();
         for _ in 0..100 {
-            assert!(!detector.observe(&background, false));
+            assert!(!detector.observe(&background, false, 0));
         }
         let mut spike = background.clone();
         spike[80] = i16::MAX;
-        assert!(!detector.observe(&spike, true));
+        assert!(!detector.observe(&spike, true, 0));
         let quiet_speech: Vec<i16> = (0..320).map(|i| {
             ((i as f32 * std::f32::consts::TAU * 180.0 / 16_000.0).sin() * 180.0) as i16
         }).collect();
         assert!(!super::loud(&quiet_speech));
         for _ in 0..500 {
-            assert!(detector.observe(&quiet_speech, true));
+            assert!(detector.observe(&quiet_speech, true, 0));
         }
-        assert!(!detector.observe(&background, true));
+        assert!(!detector.observe(&background, true, 0));
+    }
+
+    #[test]
+    fn input_activity_hears_quiet_speech_right_after_loud_wake_word_and_respects_boost() {
+        let mut detector = super::InputActivity::default();
+        let quiet_room: Vec<i16> = (0..320).map(|i| if i % 2 == 0 { 15 } else { -15 }).collect();
+        for _ in 0..120 {
+            assert!(!detector.observe(&quiet_room, false, 0));
+        }
+        // Громкое слово «Джарвис» (~0.8 с) пока listening == false не должно задирать фоновый порог.
+        let wake_word: Vec<i16> = (0..320).map(|i| {
+            ((i as f32 * std::f32::consts::TAU * 220.0 / 16_000.0).sin() * 2500.0) as i16
+        }).collect();
+        for _ in 0..40 {
+            assert!(detector.observe(&wake_word, false, 0));
+        }
+        let distant_speech: Vec<i16> = (0..320).map(|i| {
+            ((i as f32 * std::f32::consts::TAU * 180.0 / 16_000.0).sin() * 100.0) as i16
+        }).collect();
+        assert!(detector.observe(&distant_speech, true, 0));
+        assert!(!detector.observe(&quiet_room, true, 0));
+
+        // С усилением mic_boost_db = 12 ещё более тихая речь слышна, а ровный фон комнаты по-прежнему тихий.
+        let whisper: Vec<i16> = (0..320).map(|i| {
+            ((i as f32 * std::f32::consts::TAU * 180.0 / 16_000.0).sin() * 55.0) as i16
+        }).collect();
+        let very_quiet_room: Vec<i16> = (0..320).map(|i| if i % 2 == 0 { 10 } else { -10 }).collect();
+        for _ in 0..80 {
+            assert!(!detector.observe(&very_quiet_room, false, 12));
+        }
+        assert!(detector.observe(&whisper, true, 12));
+        assert!(!detector.observe(&very_quiet_room, true, 12));
+
+        // Постоянный фоновый шум (>4 с без пауз в простое) постепенно адаптирует фон.
+        let steady_fan: Vec<i16> = (0..320).map(|i| if i % 2 == 0 { 120 } else { -120 }).collect();
+        for _ in 0..350 {
+            detector.observe(&steady_fan, false, 0);
+        }
+        assert!(!detector.observe(&steady_fan, true, 0));
     }
 
     #[test]

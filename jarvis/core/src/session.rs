@@ -310,17 +310,17 @@ pub fn take_mic(pending: &mut Vec<i16>, limit: usize) -> Vec<i16> {
 /// Адаптивный порог тишины с учётом программного усиления микрофона (`mic_boost_db`).
 pub fn quiet_threshold(mic_boost_db: i64) -> u16 {
     if mic_boost_db <= 0 {
-        return 140;
+        return 80;
     }
-    (140.0 * 10f64.powf(mic_boost_db.min(24) as f64 / 20.0))
-        .min(700.0)
+    (80.0 * 10f64.powf(mic_boost_db.min(24) as f64 / 20.0))
+        .min(450.0)
         .round() as u16
 }
 
 /// Catch up only across sustained background silence, keeping at least 300 ms.
-/// Quiet speech on the station can peak at 150..700; never discard those frames.
+/// Quiet speech on the station can peak at 90..700; never discard those frames.
 pub fn take_mic_caught_up(pending: &mut Vec<i16>, limit: usize) -> Vec<i16> {
-    take_mic_caught_up_with(pending, limit, 140)
+    take_mic_caught_up_with(pending, limit, quiet_threshold(0))
 }
 
 pub fn take_mic_caught_up_with(pending: &mut Vec<i16>, limit: usize, quiet_amp: u16) -> Vec<i16> {
@@ -352,8 +352,10 @@ mod tests {
 
     #[test]
     fn adaptive_quiet_threshold_skips_boosted_room_noise_but_keeps_speech() {
-        assert_eq!(quiet_threshold(0), 140);
-        assert_eq!(quiet_threshold(18), 700);
+        assert_eq!(quiet_threshold(0), 80);
+        assert_eq!(quiet_threshold(18), 450);
+        let mut quiet_speech = vec![100i16; 16000];
+        assert_eq!(take_mic_caught_up(&mut quiet_speech, 960), vec![100i16; 960]);
         let mut pcm = vec![420i16; 16000 * 2];
         pcm.extend(vec![1200i16; 640]);
         let frame = take_mic_caught_up_with(&mut pcm, 4800, quiet_threshold(18));

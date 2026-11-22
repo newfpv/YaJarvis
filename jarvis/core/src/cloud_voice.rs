@@ -98,6 +98,7 @@ impl Voice {
                     if event.get("setupComplete").is_some() || ["session.started","session.updated","session.created"].contains(&kind){if !started{started=true;let _=ready.try_send(Ok(()));}continue;}
                     if kind=="error" || event.get("error").is_some(){let message=event.pointer("/error/message").and_then(Value::as_str).unwrap_or("Провайдер отклонил голосовую сессию");return Err(message.replace(key,"***").chars().take(240).collect());}
                     if ["session.closed"].contains(&kind){return Ok(());}
+                    if kind=="input_audio_buffer.speech_started" {self.dialog.heard_input(std::time::Instant::now());}
                     if kind=="input_audio_buffer.speech_started" || event.pointer("/serverContent/interrupted").and_then(Value::as_bool)==Some(true){self.dialog.mute();self.interrupted.store(true,Ordering::SeqCst);speaking=false;}
                     if kind=="session.input_transcript.delta" || kind=="conversation.item.input_audio_transcription.completed"{self.dialog.on_user(event[if kind.ends_with("completed"){"transcript"}else{"delta"}].as_str().unwrap_or(""));if kind.ends_with("completed"){self.dialog.unmute();}}
                     if ["session.output_transcript.delta","response.audio_transcript.delta","response.output_audio_transcript.delta"].contains(&kind){self.dialog.on_bot(event["delta"].as_str().unwrap_or(""));}

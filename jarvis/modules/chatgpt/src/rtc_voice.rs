@@ -326,6 +326,7 @@ impl RtcVoice {
                                     emit(&services,&event_id,"model",model.into()).await;
                                 }
                             },
+                            "input_audio_buffer.speech_started"|"session.input_audio.speech_started"=>emit(&services,&event_id,"speech_started",Value::Null).await,
                             "session.input_transcript.delta"|"input_transcript.delta"|"input_transcript.added"|"session.input_transcript.added"=>emit(&services,&event_id,"user",text.into()).await,
                             "session.output_transcript.delta"|"output_transcript.delta"|"output_transcript.added"|"session.output_transcript.added"=>emit(&services,&event_id,"bot",text.into()).await,
                             "delegation.created"|"session.delegation.created"=>{

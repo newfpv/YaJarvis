@@ -117,6 +117,8 @@ pub struct ChatGptSession {
     connected:AtomicBool,
     mic_boost_db:i64,
     last_input: Mutex<Option<Instant>>,
+    proxy: Option<Arc<crate::vpn::Proxy>>,
+    last_failure: Mutex<Option<crate::voice_error::VoiceFailure>>,
 }
 
 pub struct Open {
@@ -128,6 +130,7 @@ pub struct Open {
     pub journal: Arc<Journal>,
     pub memory: Option<Arc<crate::memory::Memory>>,
     pub mic_boost_db: i64,
+    pub proxy: Option<Arc<crate::vpn::Proxy>>,
 }
 
 impl ChatGptSession {
@@ -150,6 +153,8 @@ impl ChatGptSession {
             wake: tokio::sync::Notify::new(),
             done: (Mutex::new(false), Condvar::new()),
             created:Instant::now(),first_audio:AtomicBool::new(false),connected:AtomicBool::new(false),mic_boost_db:o.mic_boost_db,last_input:Mutex::default(),
+            proxy: o.proxy,
+            last_failure: Mutex::new(None),
         });
         let me = s.clone();
         rt.spawn(async move { me.run(o.host, o.voice, o.thread, o.instructions, stx).await });
@@ -183,6 +188,16 @@ impl ChatGptSession {
         };
         // `closed` may arrive immediately before the actual connection error.
         let res = await_open(open,&self.wake).await;
+        if let Err(ref err) = res && !self.cancelled.load(Ordering::SeqCst) {
+            let vpn_blocked = self.proxy.as_ref().is_some_and(|p| matches!(p.route("chatgpt"), crate::vpn::Route::Blocked(_)));
+            *self.last_failure.lock().unwrap() = Some(crate::voice_error::classify(
+                "chatgpt",
+                crate::voice_error::Stage::Connect,
+                err,
+                None,
+                vpn_blocked,
+            ));
+        }
         let ok = res.is_ok();
         let threshold = quiet_threshold(self.mic_boost_db);
         if ok {
@@ -329,6 +344,9 @@ impl Session for ChatGptSession {
     fn dialog(&self) -> &Dialog {
         &self.dialog
     }
+    fn last_failure(&self) -> Option<crate::voice_error::VoiceFailure> {
+        self.last_failure.lock().unwrap().clone()
+    }
 }
 
 /// Событие голосовой сессии от плагина chatgpt.
@@ -360,9 +378,29 @@ pub fn module_voice_event(p: Value) {
         },
         "working" => s.dialog.working(value.as_i64().unwrap_or(0) as i32),
         "limit" => {
-            LIMITED_UNTIL.store(unix() + value.as_i64().unwrap_or(60).clamp(1, 86400), Ordering::Relaxed);
+            let secs = value.as_i64().unwrap_or(60).clamp(1, 86400);
+            LIMITED_UNTIL.store(unix() + secs, Ordering::Relaxed);
+            let msg = format!("ChatGPT ограничил голосовые звонки аккаунта (429). Повторите через {} мин.", (secs + 59) / 60);
+            *s.last_failure.lock().unwrap() = Some(crate::voice_error::classify(
+                "chatgpt",
+                crate::voice_error::Stage::Stream,
+                &msg,
+                None,
+                false,
+            ));
         }
-        "error" => {log::info!("ChatGPT: ошибка сессии: {}",clip_error(text));s.dialog.finish_turn(text);},
+        "error" => {
+            log::info!("ChatGPT: ошибка сессии: {}", clip_error(text));
+            let vpn_blocked = s.proxy.as_ref().is_some_and(|p| matches!(p.route("chatgpt"), crate::vpn::Route::Blocked(_)));
+            *s.last_failure.lock().unwrap() = Some(crate::voice_error::classify(
+                "chatgpt",
+                crate::voice_error::Stage::Stream,
+                text,
+                None,
+                vpn_blocked,
+            ));
+            s.dialog.finish_turn(text);
+        },
         "closed" => s.cancel(),
         "audio" => {
             let Ok(data) = B64.decode(text) else { return };
@@ -559,6 +597,7 @@ mod tests {
                     journal: std::sync::Arc::new(super::Journal::default()),
                     memory: None,
                     mic_boost_db: 18,
+                    proxy: None,
                 },
             );
             super::Session::feed(&*s, &vec![50i16; 16_000]);

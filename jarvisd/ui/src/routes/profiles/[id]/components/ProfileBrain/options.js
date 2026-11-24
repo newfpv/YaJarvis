@@ -78,12 +78,19 @@ function chosen(options, value) {
 }
 
 export function brainOptions(state, profile) {
-  const gemini = state.gemini_model_info?.length
-    ? state.gemini_model_info.map(({ id, name, note }) => [id, note ? `${name} — ${note}` : name])
-    : state.gemini_models.map((id) => [id, id]);
+  const geminiInfo = state.gemini_model_info?.length
+    ? state.gemini_model_info.map(({ id, name, note }) => ({ id, name: name || id, note: note || "" }))
+    : (state.gemini_models || []).map((id) => ({ id, name: id, note: "" }));
+  const gemini = geminiInfo.map(({ id, name, note }) => [id, note ? `${name} — ${note}` : name]);
   const backend = state.backend_models.map((id) => [id, id]);
   const stt = modelOptions(sttModels, defaultStt, profile.stt_engine, profile.stt_model);
   const tts = modelOptions(ttsModels, defaultTts, profile.tts_engine, profile.tts_model);
+  const defaultGemini = chosen(gemini, profile.live_model);
+  const knownGemini = new Set(geminiInfo.map(({ id }) => id));
+  const savedGemini = Array.isArray(profile.gemini_models)
+    ? profile.gemini_models.filter((id) => typeof id === "string" && id.trim() && knownGemini.has(id.trim()))
+    : [];
+  const geminiModels = savedGemini.length ? [...new Set(savedGemini)] : (defaultGemini ? [defaultGemini] : []);
   return {
     providers: {
       stt: providerOptions([["elevenlabs", "ElevenLabs Scribe"], ["openai", "OpenAI"]], state.stt_plugins, profile.stt_engine),
@@ -92,10 +99,11 @@ export function brainOptions(state, profile) {
       text: optionsWithCurrent((state.text_plugins || []).map(({ id, name }) => [id, name]),
         profile.llm_plugin, `${profile.llm_plugin} (отключён)`),
     },
-    models: { backend, gemini, realtime: realtimeModels, stt: stt.options, tts: tts.options },
+    models: { backend, gemini, geminiInfo, realtime: realtimeModels, stt: stt.options, tts: tts.options },
     initial: {
       backend: chosen(backend, profile.backend_model),
-      gemini: chosen(gemini, profile.live_model),
+      gemini: defaultGemini,
+      geminiModels,
       realtime: chosen(realtimeModels, profile.live_model),
       stt: stt.values,
       tts: tts.values,

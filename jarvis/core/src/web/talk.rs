@@ -24,6 +24,31 @@ pub async fn preview_cancel(State(app): State<App>) -> Response {
     app.engine.preview_cancel();
     ok()
 }
+
+pub async fn wake_replies(State(app): State<App>) -> Response {
+    reply(StatusCode::OK, app.engine.wake_reply_status())
+}
+
+pub async fn wake_replies_generate(State(app): State<App>) -> Response {
+    match app.engine.clone().start_wake_reply_generation() {
+        Ok(status) => reply(StatusCode::OK, status),
+        Err(error) => super::bad(error),
+    }
+}
+
+pub async fn wake_replies_cancel(State(app): State<App>) -> Response {
+    app.engine.cancel_wake_reply_generation();
+    reply(StatusCode::OK, app.engine.wake_reply_status())
+}
+
+pub async fn wake_replies_clear(State(app): State<App>) -> Response {
+    let removed = app.engine.clear_wake_reply_cache();
+    let mut status = app.engine.wake_reply_status();
+    if let Some(obj) = status.as_object_mut() {
+        obj.insert("removed".into(), json!(removed));
+    }
+    reply(StatusCode::OK, status)
+}
 pub async fn say(State(app):State<App>,axum::Json(value):axum::Json<serde_json::Value>)->Response {
     let Some(text)=value["text"].as_str().map(str::trim).filter(|t|!t.is_empty() && t.len()<=16000)else{return super::bad("Текст: от 1 до 16000 байт");};
     let text=text.to_string();let speak=value["speak"].as_bool().unwrap_or(true);let engine=app.engine.clone();

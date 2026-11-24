@@ -18,6 +18,9 @@
   let sttKind = $derived(modelKind(profile.stt_engine));
   let ttsKind = $derived(modelKind(profile.tts_engine));
   let efforts = $derived(effortsFor(draft.backend));
+  let geminiPoolById = $derived(
+    Object.fromEntries((S.gemini_pool?.models || []).map((m) => [m.id, m]))
+  );
 
   function effortsFor(model) {
     return S.model_efforts?.[model] || S.efforts || [];
@@ -35,10 +38,31 @@
     onchange();
   }
 
+  function toggleGeminiModel(id, checked) {
+    const order = models.geminiInfo.map((m) => m.id);
+    const current = new Set(draft.geminiModels || []);
+    if (checked) {
+      current.add(id);
+    } else if (current.size > 1) {
+      current.delete(id);
+    } else {
+      return;
+    }
+    const next = order.filter((m) => current.has(m));
+    for (const m of current) {
+      if (!next.includes(m)) next.push(m);
+    }
+    draft.geminiModels = next;
+    draft.gemini = next[0] || draft.gemini;
+    onchange();
+  }
+
   export function getValues() {
+    const geminiModels = draft.geminiModels?.length ? [...draft.geminiModels] : (draft.gemini ? [draft.gemini] : []);
     return {
       backend: draft.backend, stt: draft.stt[sttKind].trim(), tts: draft.tts[ttsKind].trim(), customLlm: draft.customLlm.trim(),
-      live: profile.engine === "gemini" ? draft.gemini : profile.engine === "eleven_realtime" ? draft.realtime : "",
+      live: profile.engine === "gemini" ? (geminiModels[0] || "") : profile.engine === "eleven_realtime" ? draft.realtime : "",
+      geminiModels,
       idle: Number(idle), effort,
     };
   }
@@ -123,11 +147,38 @@
         </select>
       </div></div>
     {:else if engineReady && profile.engine === "gemini"}
-      <div class="eng"><div class="f half">
-        <label for="p-gmodel">Модель {@html tip("С бесплатным ключом из AI Studio все эти модели работают без оплаты, но у каждой свой дневной лимит. Когда он кончается, Джарвис сам переходит на следующую модель в списке.")}</label>
-        <select id="p-gmodel" bind:value={draft.gemini} onchange={onchange}>
-          {@render options(models.gemini)}
-        </select>
+      <div class="eng"><div class="f">
+        <span class="lbl">Модели Gemini {@html tip("Отметьте одну или несколько моделей. Джарвис начнёт с первой отмеченной; если на ней кончится лимит на всех ключах, сам перейдёт на следующую отмеченную. Неотмеченные модели не используются.")}</span>
+        <div class="gm-list" id="p-gmodels" role="group" aria-label="Модели Gemini">
+          {#each models.geminiInfo as item (item.id)}
+            {@const idx = (draft.geminiModels || []).indexOf(item.id)}
+            {@const checked = idx >= 0}
+            {@const sole = checked && (draft.geminiModels || []).length <= 1}
+            {@const poolInfo = geminiPoolById[item.id]}
+            {@const stCls = !poolInfo || !poolInfo.total_keys ? "" : poolInfo.free_keys === poolInfo.total_keys ? "ok" : poolInfo.free_keys > 0 ? "warn" : "bad"}
+            <label class={["sw hu gm-item", { on: checked }]}>
+              <input type="checkbox" {checked} disabled={sole}
+                onchange={(event) => {
+                  const input = event.currentTarget;
+                  const next = input.checked;
+                  input.checked = checked;
+                  toggleGeminiModel(item.id, next);
+                }}>
+              <span class="tr"></span>
+              <span class="hu-t">
+                <b>
+                  {item.name}
+                  {#if idx === 0}<span class="gm-tag primary">основная</span>
+                  {:else if idx > 0}<span class="gm-tag">резерв #{idx}</span>{/if}
+                  {#if poolInfo && poolInfo.total_keys > 0}
+                    <span class={["gm-st", stCls]}>{poolInfo.label}</span>
+                  {/if}
+                </b>
+                {#if item.note}<small>{item.note}</small>{/if}
+              </span>
+            </label>
+          {/each}
+        </div>
       </div></div>
     {/if}
 

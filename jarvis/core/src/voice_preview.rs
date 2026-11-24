@@ -427,9 +427,17 @@ impl Engine {
     }
 
     pub(super) fn preview_session(&self, settings: Settings, profile: Profile) -> Arc<dyn Session> {
+        self.preview_session_with(settings, profile, true)
+    }
+
+    pub(super) fn preview_session_no_failover(&self, settings: Settings, profile: Profile) -> Arc<dyn Session> {
+        self.preview_session_with(settings, profile, false)
+    }
+
+    fn preview_session_with(&self, settings: Settings, profile: Profile, allow_failover: bool) -> Arc<dyn Session> {
         let journal = Arc::new(Journal::default());
         if profile.is_classic() {
-            return crate::classic_voice::Classic::open(
+            return crate::classic_voice::Classic::open_with(
                 &self.rt,
                 self.host.clone(),
                 self.tools.clone(),
@@ -438,6 +446,8 @@ impl Engine {
                 profile,
                 INSTRUCTIONS.into(),
                 "Джарвис".into(),
+                Some(self.gemini_pool.clone()),
+                Some(self.proxy.clone()),
             );
         }
         match profile.engine.as_str() {
@@ -452,9 +462,10 @@ impl Engine {
                     journal,
                     memory: None,
                     mic_boost_db: 0,
+                    proxy: Some(self.proxy.clone()),
                 },
             ),
-            _ => crate::cloud_voice::Voice::open(
+            _ => crate::cloud_voice::Voice::open_with(
                 &self.rt,
                 self.host.clone(),
                 None,
@@ -462,6 +473,12 @@ impl Engine {
                 settings,
                 profile,
                 INSTRUCTIONS.into(),
+                crate::cloud_voice::VoiceOptions {
+                    gemini_pool: Some(self.gemini_pool.clone()),
+                    store: if allow_failover { Some(self.store.clone()) } else { None },
+                    proxy: Some(self.proxy.clone()),
+                    allow_failover,
+                },
             ),
         }
     }
@@ -625,6 +642,15 @@ fn cache_name(profile: &Profile) -> String {
 }
 
 pub(super) fn sample_name(profile: &Profile, phrase: &str) -> String {
+    sample_name_inner(profile, phrase, Some(crate::version()))
+}
+
+/// Устойчивое имя кеш-файла (без версии прошивки), чтобы отклики не сбрасывались при обновлениях.
+pub(super) fn stable_sample_name(profile: &Profile, phrase: &str) -> String {
+    sample_name_inner(profile, phrase, None)
+}
+
+fn sample_name_inner(profile: &Profile, phrase: &str, version: Option<&str>) -> String {
     let (engine, voice): (&str, &str) = if profile.is_classic() {
         (
             profile.effective_tts_engine(),
@@ -646,18 +672,17 @@ pub(super) fn sample_name(profile: &Profile, phrase: &str) -> String {
     };
     let live_model = if engine == "chatgpt" {
         "gpt-live-1.1-codex"
+    } else if engine == "gemini" && profile.live_model.is_empty() {
+        crate::gemini_pool::DEFAULT_LIVE_MODEL
     } else {
         &profile.live_model
     };
-    let identity = (
-        engine,
-        voice,
-        &profile.tts_model,
-        live_model,
-        crate::version(),
-        phrase,
-    );
-    let data = serde_json::to_vec(&identity).expect("voice sample key");
+    let data = if let Some(ver) = version {
+        serde_json::to_vec(&(engine, voice, &profile.tts_model, live_model, ver, phrase))
+    } else {
+        serde_json::to_vec(&(engine, voice, &profile.tts_model, live_model, phrase))
+    }
+    .expect("voice sample key");
     format!("{}.pcm", hex::encode(Sha256::digest(data)))
 }
 

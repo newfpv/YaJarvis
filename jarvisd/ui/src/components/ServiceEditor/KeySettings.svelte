@@ -5,26 +5,74 @@
   let { service, state, action, keydown } = $props();
   let id = $derived(service.id);
   let gemini = $derived(state.gemini_keys || []);
+  let pool = $derived(state.gemini_pool || null);
   let eleven = $derived(state.eleven_keys || []);
   let append = $derived(service.on && ["gemini", "elevenlabs"].includes(id));
   const date = (seconds) => new Date(seconds * 1000).toLocaleDateString("ru-RU", { day: "numeric", month: "long" });
+  const isBad = (status) => status === "invalid" || status === "quota_zero";
+  const isRest = (status) => status === "minute" || status === "suspected" || status === "daily" || status === "partial";
 </script>
 
 {#if id === "gemini"}
-  {#if gemini.length > 1}
+  {#if gemini.length > 0}
+    {#if pool && pool.models?.length > 0}
+      <div class="gp-sum">
+        <div class="gp-head">
+          <b>Пул ключей: {pool.total_keys}</b>
+          {#if pool.active_tail}<span class="gp-meta">активный #{(pool.active_index || 0) + 1} · {pool.active_tail}</span>{/if}
+          <span class="spacer"></span>
+          {#if pool.any_limited}
+            <button type="button" class="btn sm ghost" data-gk-reset-all="1" data-tip="Сбросить паузы по лимитам для всех ключей" onclick={action}>Сбросить все лимиты</button>
+          {/if}
+        </div>
+        <div class="ek-pills">
+          {#each pool.models as m (m.id)}
+            <span class={["ek-pill", m.free_keys === m.total_keys && m.total_keys > 0 ? "ok" : m.free_keys > 0 ? "warn" : "bad", { checked: m.checked }]}>
+              {#if m.checked}✓ {/if}{m.name}: {m.label}
+            </span>
+          {/each}
+        </div>
+      </div>
+    {/if}
     <div class="ek-list">
       {#each gemini as key, index}
-        <div class="ek" class:on={!key.spent && !gemini.slice(0, index).some((earlier) => earlier.spent < earlier.models)} class:rest={key.spent >= key.models}>
-          <b>{index + 1}</b><code>{key.tail}</code>
-          <span class="ek-st">{key.spent >= key.models ? "лимит кончился · ждёт" : key.spent ? `лимит кончился у ${key.spent} из ${key.models} моделей` : "лимит есть"}</span>
-          <span class="spacer"></span>
-          <button type="button" class="ib" data-gk-remove={index} aria-label={`Убрать ключ ${index + 1}`} onclick={action}>{@html icon("x")}</button>
+        {@const bad = isBad(key.status)}
+        {@const rest = isRest(key.status)}
+        {@const active = Boolean(key.active) && !bad && !rest}
+        {@const limitedModels = (key.model_states || []).filter((m) => m.status !== "ready")}
+        <div class="ek-wrap">
+          <div class="ek" class:on={active || (key.active && key.status === "partial")} class:rest={rest} class:bad={bad}>
+            <b>{index + 1}</b><code>{key.tail}</code>
+            <span class="ek-st">{key.label || (key.spent ? `лимит у ${key.spent} из ${key.models} моделей` : "готов")}</span>
+            <span class="spacer"></span>
+            {#if gemini.length > 1 && !key.active && !bad}
+              <button type="button" class="btn sm ghost" data-gk-activate={index} data-tip="Использовать этот ключ первым" onclick={action}>Активный</button>
+            {/if}
+            {#if key.spent > 0 || bad || rest}
+              <button type="button" class="btn sm ghost" data-gk-reset={index} data-tip="Сбросить паузу по лимиту и проверить ключ снова" onclick={action}>Сбросить</button>
+            {/if}
+            {#if gemini.length > 1}
+              <button type="button" class="ib" data-gk-remove={index} aria-label={`Убрать ключ ${index + 1}`} onclick={action}>{@html icon("x")}</button>
+            {/if}
+          </div>
+          {#if limitedModels.length > 0 || key.detail}
+            <div class="ek-sub">
+              {#if limitedModels.length > 0}
+                <div class="ek-pills">
+                  {#each key.model_states as model (model.id)}
+                    <span class={["ek-pill", model.status === "ready" ? "ok" : isBad(model.status) ? "bad" : "warn"]}>
+                      {model.name}: {model.label}
+                    </span>
+                  {/each}
+                </div>
+              {/if}
+              {#if key.detail}<small>{key.detail}</small>{/if}
+            </div>
+          {/if}
         </div>
       {/each}
     </div>
-    <p class="note">Бесплатный лимит Gemini действует на весь аккаунт целиком, а не на каждый ключ отдельно — добавляйте в пул ключи с разных аккаунтов Google. Когда лимит кончится на первом, Джарвис сам перейдёт на следующий.</p>
-  {:else if gemini[0]?.spent}
-    <p class="note">Лимит кончился у {gemini[0].spent} из {gemini[0].models} моделей этого ключа. Добавьте ключ с другого аккаунта Google — Джарвис перейдёт на него сам.</p>
+    <p class="note">Бесплатный лимит Gemini общий на весь аккаунт Google, а не на каждый ключ отдельно: в запас добавляйте ключи с разных аккаунтов. Переключение между ключами работает автоматически; переключение на другую модель работает между моделями, отмеченными галочками в профиле ассистента.</p>
   {/if}
 {:else if id === "elevenlabs" && eleven.length}
   <div class="ek-list">

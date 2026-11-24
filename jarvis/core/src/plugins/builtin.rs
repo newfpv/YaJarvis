@@ -63,9 +63,11 @@ impl Cloud {
                         }
                     }
                     message = socket.next() => match message {
-                        Some(Ok(Message::Close(reason))) => {
-                            let reason = reason.map(|reason| reason.reason.to_string()).unwrap_or_default();
-                            let _ = incoming.send(Ok(json!({"close":reason}))).await;
+                        Some(Ok(Message::Close(frame))) => {
+                            let (code, reason) = frame
+                                .map(|f| (u16::from(f.code), f.reason.to_string()))
+                                .unwrap_or((1000, String::new()));
+                            let _ = incoming.send(Ok(json!({"close":reason,"code":code}))).await;
                             break;
                         }
                         Some(Ok(message)) if message.is_text() || message.is_binary() => {

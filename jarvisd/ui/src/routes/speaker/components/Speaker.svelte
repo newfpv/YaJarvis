@@ -70,11 +70,38 @@
   let profileError = $state("");
   let selected = $state("");
   let rangesInEdit = $state({});
+  let wakeReplies = $state.raw(S.wake_replies || null);
+  let showWakeConfirm = $state(false);
+  let wakeBusy = $state(false);
+  let wakeTimer = null;
   let settings = $derived(state.settings);
   let word = $derived(profiles?.find((profile) => profile.id === selected)?.phrase || settings.wake_word || "Джарвис");
   let timezone = $derived(settings.timezone || "UTC");
   let language = $derived(settings.language ?? "ru");
   let night = $derived({ ...nightDefaults, ...settings.night });
+
+  function stopWakePoll() {
+    if (wakeTimer) {
+      clearTimeout(wakeTimer);
+      wakeTimer = null;
+    }
+  }
+
+  async function pollWakeReplies() {
+    stopWakePoll();
+    try {
+      const next = await api("GET", "/api/wake-replies", undefined, { signal });
+      if (signal.aborted) return;
+      wakeReplies = next;
+      if (next?.running) {
+        wakeTimer = setTimeout(() => void pollWakeReplies(), 1200);
+      } else {
+        await refresh();
+      }
+    } catch {
+      if (!signal.aborted) wakeTimer = setTimeout(() => void pollWakeReplies(), 2500);
+    }
+  }
 
   onMount(() => {
     if (settings.wake_training) {
@@ -85,12 +112,74 @@
         if (!signal.aborted) profileError = error.message;
       });
     }
-    return () => controller.abort();
+    if (wakeReplies?.running) {
+      wakeTimer = setTimeout(() => void pollWakeReplies(), 1000);
+    }
+    return () => {
+      stopWakePoll();
+      controller.abort();
+    };
   });
 
   async function refresh() {
     await reload();
     state = S;
+    if (S.wake_replies) wakeReplies = S.wake_replies;
+  }
+
+  async function toggleWakeReply(value) {
+    await save("wake_reply_enabled", () => ({ wake_reply_enabled: value }), value ? "Быстрый отклик включён" : "Быстрый отклик выключен");
+    if (value && wakeReplies && wakeReplies.can_generate && wakeReplies.ready < wakeReplies.total && !wakeReplies.running) {
+      showWakeConfirm = true;
+    } else if (!value) {
+      showWakeConfirm = false;
+    }
+  }
+
+  async function startWakeGenerate() {
+    if (wakeBusy) return;
+    wakeBusy = true;
+    showWakeConfirm = false;
+    try {
+      wakeReplies = await api("POST", "/api/wake-replies/generate", undefined, { signal });
+      if (wakeReplies?.running) {
+        toast("Генерация откликов запущена");
+        wakeTimer = setTimeout(() => void pollWakeReplies(), 1000);
+      } else {
+        toast("Все отклики уже готовы в кеше");
+      }
+    } catch (error) {
+      if (!signal.aborted) toast(error.message, true);
+    } finally {
+      wakeBusy = false;
+    }
+  }
+
+  async function cancelWakeGenerate() {
+    if (wakeBusy) return;
+    wakeBusy = true;
+    try {
+      wakeReplies = await api("POST", "/api/wake-replies/cancel", undefined, { signal });
+      toast("Останавливаю генерацию откликов");
+    } catch (error) {
+      if (!signal.aborted) toast(error.message, true);
+    } finally {
+      wakeBusy = false;
+    }
+  }
+
+  async function clearWakeCache() {
+    if (wakeBusy || !confirm("Очистить сохранённые быстрые отклики для текущего ассистента?")) return;
+    wakeBusy = true;
+    showWakeConfirm = false;
+    try {
+      wakeReplies = await api("DELETE", "/api/wake-replies", undefined, { signal });
+      toast("Кеш откликов очищен");
+    } catch (error) {
+      if (!signal.aborted) toast(error.message, true);
+    } finally {
+      wakeBusy = false;
+    }
   }
 
   function enqueue(key, write) {
@@ -271,8 +360,58 @@
     (value) => saveToggle("wake_enabled", value, "Джарвис снова слушает", "Джарвис больше не откликается на слово"),
     "Выключите, если Джарвис нужен только по кнопке «Поговорить». Алиса работает в любом случае.")}
   {@render toggle("Быстрый голосовой отклик", "wake_reply_enabled", settings.wake_reply_enabled !== false,
-    (value) => saveToggle("wake_reply_enabled", value, "Быстрый отклик включён", "Быстрый отклик выключен"),
-    "После слова активации Джарвис сразу говорит «слушаю», «угу» или другую короткую фразу голосом активного ассистента. Вопрос можно начать сразу.")}
+    (value) => void toggleWakeReply(value),
+    "После слова активации Джарвис сразу говорит «слушаю», «угу» или другую короткую фразу из локального кеша. В фоне фразы автоматически не генерируются, чтобы не тратить лимит API.")}
+  {#if wakeReplies && (settings.wake_reply_enabled !== false || wakeReplies.ready > 0 || wakeReplies.running)}
+    {@const missingCount = Math.max(0, (wakeReplies.total || 12) - (wakeReplies.ready || 0))}
+    <div class="wr-box">
+      <div class="wr-head">
+        <span>
+          {#if wakeReplies.running}
+            Генерирую отклики: <b>{wakeReplies.done} из {wakeReplies.total}</b> ({wakeReplies.engine_name} · {wakeReplies.voice})
+          {:else}
+            В кеше: <b>{wakeReplies.ready} из {wakeReplies.total}</b> фраз ({wakeReplies.engine_name} · {wakeReplies.voice})
+          {/if}
+        </span>
+      </div>
+      {#if wakeReplies.error}
+        <p class="err" role="alert">{wakeReplies.error}</p>
+      {/if}
+      {#if !wakeReplies.can_generate && wakeReplies.missing}
+        <p class="note">{wakeReplies.missing}</p>
+      {:else if wakeReplies.running}
+        <div class="row">
+          <button type="button" class="btn sm ghost" disabled={wakeBusy} onclick={cancelWakeGenerate}>Остановить</button>
+        </div>
+      {:else if showWakeConfirm && missingCount > 0}
+        <div class="wr-warn">
+          <p>
+            Будет сгенерировано <b>{missingCount}</b> коротких фраз голосом «{wakeReplies.voice}» через <b>{wakeReplies.engine_name}</b>.
+            Это потратит запросы и может затронуть лимит (особенно на бесплатном Gemini или подписке ChatGPT).
+            При достижении лимита генерация сразу остановится, а готовые фразы сохранятся и переживут обновления.
+          </p>
+          <div class="row">
+            <button type="button" class="btn sm primary" disabled={wakeBusy} onclick={startWakeGenerate}>Сгенерировать сейчас</button>
+            <button type="button" class="btn sm ghost" disabled={wakeBusy} onclick={() => { showWakeConfirm = false; }}>Не сейчас</button>
+          </div>
+        </div>
+      {:else}
+        <div class="row">
+          {#if missingCount > 0}
+            <button type="button" class="btn sm" disabled={wakeBusy} onclick={() => { showWakeConfirm = true; }}>
+              {wakeReplies.ready > 0 ? `Догенерировать (${missingCount} фраз)` : `Сгенерировать отклики (${missingCount} фраз)`}
+            </button>
+          {/if}
+          {#if wakeReplies.ready > 0}
+            <button type="button" class="btn sm ghost" disabled={wakeBusy} onclick={clearWakeCache}>Очистить кеш</button>
+          {/if}
+        </div>
+      {/if}
+    </div>
+  {/if}
+  {@render toggle("Озвучивать ошибки Алисой", "voice_error_alice", settings.voice_error_alice !== false,
+    (value) => saveToggle("voice_error_alice", value, "Алиса сообщит, если голосовой ИИ не ответит", "Голосовые уведомления об ошибках выключены"),
+    "Если голосовой движок не смог подключиться или упёрся в лимит после всех автопереключений, штатная Алиса коротко назовёт причину. Ночью и при команде «Стоп» не срабатывает.")}
   {#if !settings.wake_word}
     {@render toggle("Проверять имя перед ответом", "wake_check", !!settings.wake_check,
       (value) => saveToggle("wake_check", value, "Сначала проверяю имя, потом отвечаю", "Отклик сразу, как у Алисы"),

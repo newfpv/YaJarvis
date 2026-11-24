@@ -41,10 +41,23 @@ pub async fn put(State(app):State<App>,Json(v):Json<Value>)->Response {
         let params=if service=="yandex"{json!({"op":"settings.validate","token":key})}else{json!({"op":"settings.validate","key":key})};
         if let Err(e)=provider.request(capability,params,Duration::from_secs(20)).await{return bad(e);}
     }
+    let gemini_key_for_pool = (service == "gemini").then(|| key.clone());
     match app.store.update(|s|->Result<(),std::io::Error>{
         if snapshot(s,service)!=before{return Err(std::io::Error::other("Подключение изменилось; повторите сохранение"));}
         assign(s,service,key);Ok(())
-    }){Ok(())=>ok(),Err(e)=>bad(e.to_string())}
+    }){
+        Ok(())=>{
+            if let Some(k) = gemini_key_for_pool {
+                if k.is_empty() {
+                    app.engine.gemini_pool.clear_all();
+                } else {
+                    app.engine.gemini_pool.reset_key(&k);
+                }
+            }
+            ok()
+        }
+        Err(e)=>bad(e.to_string())
+    }
 }
 pub async fn gemini_pool(State(app):State<App>,Json(v):Json<Value>)->Response{pool(&app,"gemini",v)}
 pub async fn eleven_pool(State(app):State<App>,Json(v):Json<Value>)->Response{pool(&app,"elevenlabs",v)}
@@ -167,13 +180,36 @@ pub async fn delete_voice(
 fn pool(app:&App,service:&str,v:Value)->Response{
     let Some(object)=v.as_object().filter(|o|o.len()==1)else{return bad("Нужна одна операция с ключом");};
     let (op,value)=object.iter().next().unwrap();
+    if service == "gemini" && op == "reset_all" {
+        app.engine.gemini_pool.clear_all();
+        return ok();
+    }
     let Some(index)=value.as_u64().and_then(|i|usize::try_from(i).ok())else{return bad("Неверный номер ключа");};
-    if op!="remove" && !(service=="elevenlabs" && op=="reset"){return bad("Неизвестная операция с ключом");}
+    let allowed = op == "remove"
+        || (service == "elevenlabs" && op == "reset")
+        || (service == "gemini" && matches!(op.as_str(), "reset" | "activate"));
+    if !allowed {return bad("Неизвестная операция с ключом");}
+    let mut reset_gemini_key: Option<String> = None;
     match app.store.update(|s|->Result<(),std::io::Error>{
         let invalid=||std::io::Error::other("Ключ с таким номером отсутствует");
         if service=="gemini"{
-            if index>=s.gemini_keys.len(){return Err(invalid());}s.gemini_keys.remove(index);
-            if !s.gemini_keys.contains(&s.gemini_key){s.gemini_key=s.gemini_keys.first().cloned().unwrap_or_default();}
+            if index>=s.gemini_keys.len(){return Err(invalid());}
+            match op.as_str() {
+                "remove" => {
+                    let removed = s.gemini_keys.remove(index);
+                    reset_gemini_key = Some(removed);
+                    if !s.gemini_keys.contains(&s.gemini_key){
+                        s.gemini_key=s.gemini_keys.first().cloned().unwrap_or_default();
+                    }
+                }
+                "reset" => {
+                    reset_gemini_key = Some(s.gemini_keys[index].clone());
+                }
+                "activate" => {
+                    s.gemini_key = s.gemini_keys[index].clone();
+                }
+                _ => {}
+            }
         }else{
             if index>=s.eleven_keys.len(){return Err(invalid());}
             if op=="remove"{s.eleven_keys.remove(index);}else{s.eleven_keys[index].until=0;s.eleven_keys[index].why.clear();}
@@ -182,7 +218,15 @@ fn pool(app:&App,service:&str,v:Value)->Response{
             s.elevenlabs_key=active.map(|k|k.key.clone()).unwrap_or_default();
         }
         Ok(())
-    }){Ok(())=>ok(),Err(e)=>bad(e.to_string())}
+    }){
+        Ok(())=>{
+            if let Some(key) = reset_gemini_key {
+                app.engine.gemini_pool.reset_key(&key);
+            }
+            ok()
+        }
+        Err(e)=>bad(e.to_string())
+    }
 }
 
 #[cfg(test)]

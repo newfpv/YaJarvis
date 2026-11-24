@@ -5,8 +5,10 @@
 //! AliceCapabilityMethod{1: START_REQUEST(0), 2: VinsRequest{1:id, 2:event_json, 4:is_silent, 18:TEXT_INPUT(1)}}.
 
 use std::{
-    io::Write,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    collections::BTreeMap,
+    io::{Read, Write},
+    net::SocketAddr,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 fn varint(mut v: u64, b: &mut Vec<u8>) {
@@ -28,6 +30,18 @@ fn pb_bytes(field: u64, v: &[u8], b: &mut Vec<u8>) {
     b.extend_from_slice(v);
 }
 
+fn rpc_frame(field: u64, payload: &[u8]) -> Vec<u8> {
+    let mut remote = vec![];
+    pb_bytes(7, b"AliceCapability", &mut remote);
+    pb_bytes(field, payload, &mut remote);
+    let mut env = vec![];
+    pb_bytes(252, &remote, &mut env);
+    pb_int(253, 210, &mut env);
+    let mut out = (env.len() as u32).to_le_bytes().to_vec();
+    out.extend(env);
+    out
+}
+
 fn frame(text: &str, silent: bool) -> Vec<u8> {
     let ev = serde_json::json!({"type": "text_input", "text": text}).to_string();
     let ns = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
@@ -39,15 +53,119 @@ fn frame(text: &str, silent: bool) -> Vec<u8> {
     let mut method = vec![];
     pb_int(1, 0, &mut method); // START_REQUEST
     pb_bytes(2, &vins, &mut method);
-    let mut remote = vec![];
-    pb_bytes(7, b"AliceCapability", &mut remote);
-    pb_bytes(8, &method, &mut remote);
-    let mut env = vec![];
-    pb_bytes(252, &remote, &mut env);
-    pb_int(253, 210, &mut env);
-    let mut out = (env.len() as u32).to_le_bytes().to_vec();
-    out.extend(env);
-    out
+    rpc_frame(8, &method)
+}
+
+fn subscribe_frame() -> Vec<u8> {
+    let mut sub = vec![];
+    pb_bytes(1, b"AliceCapability", &mut sub);
+    rpc_frame(20, &sub)
+}
+
+fn vocalize_frame(text: &str) -> Vec<u8> {
+    // START_VOCALIZE=18, events=true, TVocalizeDirective(text, Append=1).
+    let mut directive = vec![];
+    pb_bytes(1, text.as_bytes(), &mut directive);
+    pb_int(2, 1, &mut directive);
+    let mut method = vec![];
+    pb_int(1, 18, &mut method);
+    pb_int(3, 1, &mut method);
+    pb_bytes(13, &directive, &mut method);
+    rpc_frame(8, &method)
+}
+
+fn cancel_frame() -> Vec<u8> {
+    // CANCEL_DIALOG_AND_CLEAR_QUEUE=6
+    let mut method = vec![];
+    pb_int(1, 6, &mut method);
+    rpc_frame(8, &method)
+}
+
+#[derive(Debug)]
+enum PbVal<'a> {
+    Varint(u64),
+    Bytes(&'a [u8]),
+}
+
+fn decode_fields(data: &[u8]) -> Option<BTreeMap<u64, PbVal<'_>>> {
+    let mut offset = 0usize;
+    let read_varint = |off: &mut usize| -> Option<u64> {
+        let mut value = 0u64;
+        for shift in (0..70).step_by(7) {
+            let byte = *data.get(*off)?;
+            *off += 1;
+            if shift == 63 && byte > 1 {
+                return None;
+            }
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte < 0x80 {
+                return Some(value);
+            }
+        }
+        None
+    };
+    let mut out = BTreeMap::new();
+    while offset < data.len() {
+        let key = read_varint(&mut offset)?;
+        let field = key >> 3;
+        if field == 0 {
+            return None;
+        }
+        match key & 7 {
+            0 => {
+                let v = read_varint(&mut offset)?;
+                out.insert(field, PbVal::Varint(v));
+            }
+            2 => {
+                let len = usize::try_from(read_varint(&mut offset)?).ok()?;
+                let end = offset.checked_add(len)?;
+                let slice = data.get(offset..end)?;
+                offset = end;
+                out.insert(field, PbVal::Bytes(slice));
+            }
+            1 => {
+                offset = offset.checked_add(8)?;
+                if offset > data.len() {
+                    return None;
+                }
+            }
+            5 => {
+                offset = offset.checked_add(4)?;
+                if offset > data.len() {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+fn extract_alice_event(envelope: &[u8]) -> Option<u64> {
+    let env = decode_fields(envelope)?;
+    let tag = match env.get(&253) {
+        Some(PbVal::Varint(v)) => *v,
+        _ => return None,
+    };
+    let remote_bytes = match env.get(&252) {
+        Some(PbVal::Bytes(b)) => *b,
+        _ => return None,
+    };
+    let remote = decode_fields(remote_bytes)?;
+    let is_alice = tag == 3
+        || (tag == 210
+            && matches!(remote.get(&7), Some(PbVal::Bytes(b)) if *b == b"AliceCapability"));
+    if !is_alice {
+        return None;
+    }
+    let event_bytes = match remote.get(&18) {
+        Some(PbVal::Bytes(b)) => *b,
+        _ => return None,
+    };
+    match decode_fields(event_bytes)?.get(&1) {
+        Some(PbVal::Varint(code)) => Some(*code),
+        _ => None,
+    }
 }
 
 /// Отправить Алисе текстовый запрос. silent=false — она ответит голосом, как обычно. Блокирует ~0,2 с.
@@ -61,6 +179,130 @@ pub fn text(text: &str, silent: bool) -> Result<(), String> {
     let r = c.write_all(&frame(text, silent)).map_err(|e| e.to_string());
     std::thread::sleep(Duration::from_millis(150)); // дать aliced прочитать кадр до закрытия
     r
+}
+
+/// Дословно озвучить фразу штатным голосом Алисы через `AliceCapability.START_VOCALIZE`.
+/// Не трактует текст как команду и не зависит от ключей AI / VPN.
+pub fn vocalize(text: &str, timeout: Duration, cancelled: impl Fn() -> bool) -> Result<(), String> {
+    let addr: SocketAddr = "127.0.0.1:9875".parse().unwrap();
+    vocalize_on(addr, text, timeout, cancelled)
+}
+
+/// Отменить текущую озвучку Алисы (например, по «Стоп» или новой активации).
+pub fn cancel_vocalize() {
+    let addr: SocketAddr = "127.0.0.1:9875".parse().unwrap();
+    if let Ok(mut c) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(400)) {
+        let _ = c.set_write_timeout(Some(Duration::from_millis(500)));
+        let _ = c.write_all(&cancel_frame());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn vocalize_on(
+    addr: SocketAddr,
+    text: &str,
+    timeout: Duration,
+    cancelled: impl Fn() -> bool,
+) -> Result<(), String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(());
+    }
+    if cancelled() {
+        return Ok(());
+    }
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(1))
+        .map_err(|e| format!("Алиса недоступна: {e}"))?;
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(150)));
+    let mut payload = subscribe_frame();
+    payload.extend_from_slice(&vocalize_frame(text));
+    stream
+        .write_all(&payload)
+        .map_err(|e| format!("не удалось отправить фразу Алисе: {e}"))?;
+
+    let started_at = Instant::now();
+    // Если прошивка не шлёт события поля 18, не блокируем поток на весь таймаут.
+    let no_event_grace = Duration::from_secs(3).min(timeout);
+    let mut tts_started = false;
+    let mut len_buf = [0u8; 4];
+    let mut len_got = 0usize;
+
+    while started_at.elapsed() < timeout {
+        if cancelled() {
+            let _ = stream.write_all(&cancel_frame());
+            std::thread::sleep(Duration::from_millis(50));
+            return Ok(());
+        }
+        match stream.read(&mut len_buf[len_got..]) {
+            Ok(0) => {
+                return if tts_started {
+                    Ok(())
+                } else {
+                    Err("Алиса закрыла соединение до начала озвучки".into())
+                };
+            }
+            Ok(n) => {
+                len_got += n;
+                if len_got < 4 {
+                    continue;
+                }
+                len_got = 0;
+                let size = u32::from_le_bytes(len_buf) as usize;
+                if size == 0 || size > 512 * 1024 {
+                    return Err("некорректный ответ Quasar IPC".into());
+                }
+                let mut body = vec![0u8; size];
+                let mut got = 0usize;
+                while got < size {
+                    if cancelled() {
+                        let _ = stream.write_all(&cancel_frame());
+                        std::thread::sleep(Duration::from_millis(50));
+                        return Ok(());
+                    }
+                    if started_at.elapsed() >= timeout {
+                        break;
+                    }
+                    match stream.read(&mut body[got..]) {
+                        Ok(0) => return Err("Quasar IPC оборвал кадр".into()),
+                        Ok(k) => got += k,
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            continue;
+                        }
+                        Err(e) => return Err(format!("ошибка чтения Quasar IPC: {e}")),
+                    }
+                }
+                if got < size {
+                    break;
+                }
+                if let Some(code) = extract_alice_event(&body) {
+                    match code {
+                        6 => tts_started = true,            // TTS_STARTED
+                        1 if tts_started => return Ok(()),  // TTS_COMPLETED
+                        4 => return Err("штатный TTS Алисы сообщил об ошибке".into()), // ON_ALICE_ERROR
+                        _ => {}
+                    }
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if !tts_started && started_at.elapsed() >= no_event_grace {
+                    return Ok(());
+                }
+            }
+            Err(e) => return Err(format!("ошибка канала Алисы: {e}")),
+        }
+    }
+    Ok(())
 }
 
 pub const MAIND_LOG: &str = "/data/quasar/daemons_logs/maind.log";
@@ -338,6 +580,27 @@ pub fn watch_mic(mic: std::sync::Arc<crate::audio::Mic>) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    fn make_event_frame(tag: u64, event_code: u64) -> Vec<u8> {
+        let mut ev = vec![];
+        pb_int(1, event_code, &mut ev);
+        let mut remote = vec![];
+        pb_bytes(7, b"AliceCapability", &mut remote);
+        pb_bytes(18, &ev, &mut remote);
+        let mut env = vec![];
+        pb_bytes(252, &remote, &mut env);
+        pb_int(253, tag, &mut env);
+        let mut out = (env.len() as u32).to_le_bytes().to_vec();
+        out.extend(env);
+        out
+    }
+
     #[test]
     fn frame_layout() {
         let f = super::frame("пауза", true);
@@ -346,5 +609,83 @@ mod tests {
         assert_eq!(&f[4..6], &[0xe2, 0x0f]); // поле 252, длина следом
         assert!(f.ends_with(&[0xe8, 0x0f, 0xd2, 0x01])); // 253=210
         assert!(super::misses_tap(" /system/vendor/quasar/launch.json ", &["libc.so".into()]));
+
+        // Проверка START_VOCALIZE (метод 18, events=1, TVocalizeDirective) и CANCEL (6).
+        let vf = super::vocalize_frame("Проверка связи");
+        let vn = u32::from_le_bytes(vf[..4].try_into().unwrap()) as usize;
+        assert_eq!(vn, vf.len() - 4);
+        let env = decode_fields(&vf[4..]).unwrap();
+        let PbVal::Bytes(remote_bytes) = env.get(&252).unwrap() else { panic!() };
+        let remote = decode_fields(remote_bytes).unwrap();
+        let PbVal::Bytes(method_bytes) = remote.get(&8).unwrap() else { panic!() };
+        let method = decode_fields(method_bytes).unwrap();
+        assert!(matches!(method.get(&1), Some(PbVal::Varint(18))));
+        assert!(matches!(method.get(&3), Some(PbVal::Varint(1))));
+        let PbVal::Bytes(dir_bytes) = method.get(&13).unwrap() else { panic!() };
+        let dir = decode_fields(dir_bytes).unwrap();
+        assert!(matches!(dir.get(&1), Some(PbVal::Bytes(b)) if *b == "Проверка связи".as_bytes()));
+        assert!(matches!(dir.get(&2), Some(PbVal::Varint(1))));
+
+        let cf = super::cancel_frame();
+        let env = decode_fields(&cf[4..]).unwrap();
+        let PbVal::Bytes(remote_bytes) = env.get(&252).unwrap() else { panic!() };
+        let remote = decode_fields(remote_bytes).unwrap();
+        let PbVal::Bytes(method_bytes) = remote.get(&8).unwrap() else { panic!() };
+        assert!(matches!(decode_fields(method_bytes).unwrap().get(&1), Some(PbVal::Varint(6))));
+    }
+
+    #[test]
+    fn vocalize_handles_completion_error_and_cancel() {
+        // 1. Успешный цикл TTS_STARTED(6) -> TTS_COMPLETED(1).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 512];
+            let _ = sock.read(&mut buf);
+            sock.write_all(&make_event_frame(3, 6)).unwrap();
+            sock.write_all(&make_event_frame(210, 1)).unwrap();
+        });
+        vocalize_on(addr, "Привет", Duration::from_secs(3), || false).unwrap();
+        server.join().unwrap();
+
+        // 2. ON_ALICE_ERROR(4) возвращает Err для локального earcon-фоллбека.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 512];
+            let _ = sock.read(&mut buf);
+            sock.write_all(&make_event_frame(210, 4)).unwrap();
+        });
+        assert!(vocalize_on(addr, "Ошибка", Duration::from_secs(3), || false).is_err());
+        server.join().unwrap();
+
+        // 3. Отмена во время озвучки отправляет CANCEL_DIALOG_AND_CLEAR_QUEUE(6).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let c_srv = cancelled.clone();
+        let got_cancel = Arc::new(AtomicBool::new(false));
+        let gc_srv = got_cancel.clone();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut buf = [0u8; 512];
+            let _ = sock.read(&mut buf);
+            sock.write_all(&make_event_frame(3, 6)).unwrap();
+            std::thread::sleep(Duration::from_millis(80));
+            c_srv.store(true, Ordering::SeqCst);
+            let mut cancel_buf = [0u8; 256];
+            if let Ok(n) = sock.read(&mut cancel_buf)
+                && n > 4
+                && cancel_buf[..n].windows(cancel_frame().len()).any(|w| w == cancel_frame().as_slice())
+            {
+                gc_srv.store(true, Ordering::SeqCst);
+            }
+        });
+        vocalize_on(addr, "Длинная фраза", Duration::from_secs(3), || cancelled.load(Ordering::SeqCst)).unwrap();
+        server.join().unwrap();
+        assert!(got_cancel.load(Ordering::SeqCst));
     }
 }

@@ -91,6 +91,8 @@ impl EchoWindow {
 pub struct Engine {
     pub store: Store,
     pub host: Arc<Host>,
+    pub proxy: Arc<crate::vpn::Proxy>,
+    pub gemini_pool: Arc<crate::gemini_pool::GeminiPool>,
     pub mic: Arc<Mic>,
     pub player: Arc<Player>,
     pub leds: Arc<Leds>,
@@ -109,8 +111,11 @@ pub struct Engine {
     speech_notify: tokio::sync::Notify,
     saying: AtomicBool,
     previews: voice_preview::Previews,
+    wake_replies: wake_reply::WakeReplyManager,
     wake_reply_sequence: AtomicU64,
     cmds: std::sync::OnceLock<crate::cmdspot::CmdSpotter>,
+    last_error_notice: Mutex<Option<(String, Instant)>>,
+    error_speaking: AtomicBool,
 }
 
 fn same(a: &Arc<dyn Session>, b: &Arc<dyn Session>) -> bool {
@@ -224,7 +229,7 @@ pub fn key_missing(host: &Host, s: &Settings, engine: &str) -> String {
         "chatgpt" if !chatgpt::signed_in(&s.chatgpt) => "не выполнен вход в ChatGPT — войдите в «Подключениях»".into(),
         "chatgpt" => chatgpt::voice_limit().unwrap_or_default(),
         "live" | "openai" => if s.openai_key.is_empty(){"Добавьте ключ OpenAI в «Подключениях»".into()}else{String::new()},
-        "gemini" => if s.gemini_key.is_empty(){"Добавьте ключ Gemini в «Подключениях»".into()}else{String::new()},
+        "gemini" => if s.gemini_key.is_empty() && s.gemini_keys.is_empty(){"Добавьте ключ Gemini в «Подключениях»".into()}else{String::new()},
         "grok" => if s.grok_key.is_empty(){"Добавьте ключ Grok в «Подключениях»".into()}else{String::new()},
         "elevenlabs"|"eleven_realtime"=>if s.elevenlabs_key.is_empty(){"Добавьте ключ ElevenLabs в «Подключениях»".into()}else{String::new()},
         other => format!("движок «{other}» ещё не перенесён в новое ядро — выберите ассистента на ChatGPT"),
@@ -272,7 +277,7 @@ pub fn llm_missing(host: &Host, s: &Settings, p: &Profile) -> String {
     match p.effective_llm_engine() {
         "" => {
             let any = (host.provider("openai").is_ok() && !s.openai_key.is_empty())
-                || (host.provider("gemini").is_ok() && !s.gemini_key.is_empty())
+                || (host.provider("gemini").is_ok() && (!s.gemini_key.is_empty() || !s.gemini_keys.is_empty()))
                 || (host.provider("grok").is_ok() && !s.grok_key.is_empty())
                 || (host.provider("chatgpt").is_ok() && chatgpt::signed_in(&s.chatgpt));
             if any {
@@ -337,6 +342,7 @@ impl Engine {
         rt: tokio::runtime::Handle,
         store: Store,
         host: Arc<Host>,
+        proxy: Arc<crate::vpn::Proxy>,
         mic: Arc<Mic>,
         player: Arc<Player>,
         leds: Arc<Leds>,
@@ -346,15 +352,19 @@ impl Engine {
         data: PathBuf,
         music: Arc<crate::music::Music>,
     ) -> Arc<Engine> {
-        Arc::new(Engine { store, host, mic, player, leds, journal, tools, music, listener, data, rt, st: Mutex::default(), reset_wake: AtomicBool::new(false),
+        let gemini_pool = crate::gemini_pool::GeminiPool::load(data.join("gemini-quota.json"));
+        Arc::new(Engine {
+            store, host, proxy, gemini_pool, mic, player, leds, journal, tools, music, listener, data, rt,
+            st: Mutex::default(), reset_wake: AtomicBool::new(false),
             recording_word: AtomicBool::new(false), training_active: AtomicBool::new(false), training_until: Mutex::new(None),
             speech_epoch: AtomicU64::new(0), speech_notify: tokio::sync::Notify::new(), saying: AtomicBool::new(false), previews: Default::default(),
-            wake_reply_sequence: AtomicU64::new(0), cmds: Default::default() })
+            wake_replies: Default::default(), wake_reply_sequence: AtomicU64::new(0), cmds: Default::default(),
+            last_error_notice: Mutex::default(), error_speaking: AtomicBool::new(false),
+        })
     }
 
     /// Слушать микрофон в своём потоке: слово, звук в разговор, перебивание.
     pub fn run(self: &Arc<Self>, mut det: Box<dyn Wake>) {
-        self.start_wake_reply_cache();
         let w = Arc::downgrade(self);
         if let Some(c) = crate::cmdspot::CmdSpotter::new(
             &self.data,
@@ -583,6 +593,8 @@ impl Engine {
         if sure {
             self.leds.set(Mode::Listening);
         }
+        self.speech_epoch.fetch_add(1, Ordering::SeqCst);
+        self.cancel_wake_reply_generation();
         self.reset_wake.store(true, Ordering::Relaxed);
         if by_word {
             log::info!("Джарвис: активация ({source}, уверенность {prob:.2})");
@@ -620,7 +632,7 @@ impl Engine {
                 }
                 let mut guard = ConverseGuard { engine: &e, completed: false };
                 let preroll = if by_word { clip.clone() } else { vec![] };
-                e.converse(by_word, sure, preroll, clip);
+                let failure = e.converse(by_word, sure, preroll, clip);
                 guard.completed = true;
                 let queued = {
                     let mut st = e.st.lock().unwrap();
@@ -636,6 +648,9 @@ impl Engine {
                 };
                 e.reset_wake.store(true, Ordering::Relaxed);
                 e.leds.set(Mode::Off);
+                if let Some(failure) = failure && !queued {
+                    e.announce_voice_failure(failure);
+                }
                 if queued {
                     e.trigger("слово", 1.0);
                 }
@@ -728,9 +743,36 @@ impl Engine {
 
     /// Открыть разговор с моделью тем движком, который выбран у ассистента.
     fn new_session(&self, s: &Settings, p: &Profile) -> Arc<dyn Session> {
-        if p.is_classic(){return crate::classic_voice::Classic::open(&self.rt,self.host.clone(),self.tools.clone(),self.journal.clone(),s.clone(),p.clone(),self.instructions(s,p),self.listener.phrase());}
-        if ["","live","openai","gemini","grok","eleven_realtime"].contains(&p.engine.as_str()) {
-            return crate::cloud_voice::Voice::open(&self.rt,self.host.clone(),Some(self.tools.clone()),self.journal.clone(),s.clone(),p.clone(),self.instructions(s,p));
+        if p.is_classic() {
+            return crate::classic_voice::Classic::open_with(
+                &self.rt,
+                self.host.clone(),
+                self.tools.clone(),
+                self.journal.clone(),
+                s.clone(),
+                p.clone(),
+                self.instructions(s, p),
+                self.listener.phrase(),
+                Some(self.gemini_pool.clone()),
+                Some(self.proxy.clone()),
+            );
+        }
+        if ["", "live", "openai", "gemini", "grok", "eleven_realtime"].contains(&p.engine.as_str()) {
+            return crate::cloud_voice::Voice::open_with(
+                &self.rt,
+                self.host.clone(),
+                Some(self.tools.clone()),
+                self.journal.clone(),
+                s.clone(),
+                p.clone(),
+                self.instructions(s, p),
+                crate::cloud_voice::VoiceOptions {
+                    gemini_pool: Some(self.gemini_pool.clone()),
+                    store: Some(self.store.clone()),
+                    proxy: Some(self.proxy.clone()),
+                    allow_failover: true,
+                },
+            );
         }
         chatgpt::ChatGptSession::open(
             &self.rt,
@@ -743,15 +785,26 @@ impl Engine {
                 journal: self.journal.clone(),
                 memory: self.tools.memory.clone(),
                 mic_boost_db: s.mic_boost_db,
+                proxy: Some(self.proxy.clone()),
             },
         )
     }
 
     /// Выбранная текстовая модель памяти или очередь подключённых провайдеров в режиме автовыбора.
     pub fn summarizer(&self) -> crate::memory::Summarizer {
-        let (host, store, tools) = (self.host.clone(), self.store.clone(), self.tools.clone());
+        let (host, store, tools, gemini_pool) = (
+            self.host.clone(),
+            self.store.clone(),
+            self.tools.clone(),
+            self.gemini_pool.clone(),
+        );
         Arc::new(move |instructions: String, text: String| {
-            let (host, store, tools) = (host.clone(), store.clone(), tools.clone());
+            let (host, store, tools, gemini_pool) = (
+                host.clone(),
+                store.clone(),
+                tools.clone(),
+                gemini_pool.clone(),
+            );
             Box::pin(async move {
                 let s = store.get();
                 let mut error = crate::memory::NO_SUMMARIZER.to_string();
@@ -760,7 +813,7 @@ impl Engine {
                         engine: provider.into(), backend_model: crate::llm::memory_model(&s, provider).into(),
                         effort: "low".into(), web_search: false, ..Default::default()
                     };
-                    match crate::llm::ask(&host, &s, &profile, &instructions, &text, &tools, vec![]).await {
+                    match crate::llm::ask_with_pool(&host, &s, &profile, &instructions, &text, &tools, vec![], Some(&gemini_pool)).await {
                         Ok(summary) => return Ok(summary),
                         Err(why) => error = why,
                     }
@@ -783,14 +836,113 @@ impl Engine {
         }
     }
 
+    fn should_announce_failure(&self, failure: &crate::voice_error::VoiceFailure, now: Instant) -> bool {
+        if failure.expected {
+            return false;
+        }
+        let key = failure.cooldown_key();
+        let mut last = self.last_error_notice.lock().unwrap();
+        if let Some((prev_key, at)) = last.as_ref()
+            && *prev_key == key
+            && now.saturating_duration_since(*at) < Duration::from_secs(20)
+        {
+            return false;
+        }
+        *last = Some((key, now));
+        true
+    }
+
+    /// Единый обработчик финального отказа реального голосового диалога (issue #34):
+    /// короткий диагноз через штатный `START_VOCALIZE` Алисы без повторного вызова сломанного AI.
+    fn announce_voice_failure(self: &Arc<Self>, failure: crate::voice_error::VoiceFailure) {
+        if failure.expected {
+            return;
+        }
+        log::warn!("{}", failure.log_line());
+        if !self.should_announce_failure(&failure, Instant::now()) {
+            return;
+        }
+        if !self.store.with(|s| s.voice_error_alice) {
+            return;
+        }
+        if self.store.is_night() {
+            log::info!("диагностика голоса: ночной режим — короткий сигнал вместо речи Алисы");
+            self.earcon(false);
+            return;
+        }
+        if self
+            .error_speaking
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let tz = self.store.timezone();
+        let phrase = failure.alice_phrase(&tz);
+        let epoch = self.speech_epoch.load(Ordering::SeqCst);
+        let engine = self.clone();
+        let _ = std::thread::Builder::new()
+            .name("alice-diag".into())
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                struct SpeakingGuard<'a>(&'a Engine);
+                impl Drop for SpeakingGuard<'_> {
+                    fn drop(&mut self) {
+                        self.0.error_speaking.store(false, Ordering::SeqCst);
+                    }
+                }
+                let _guard = SpeakingGuard(&engine);
+                if engine.speech_epoch.load(Ordering::SeqCst) != epoch || engine.talking() {
+                    return;
+                }
+                log::info!("диагностика Алисой: «{phrase}»");
+                if let Err(err) = alice::vocalize(&phrase, Duration::from_secs(15), || {
+                    engine.speech_epoch.load(Ordering::SeqCst) != epoch || engine.talking()
+                }) {
+                    log::info!("диагностика Алисой недоступна ({err}) — локальный сигнал");
+                    if engine.speech_epoch.load(Ordering::SeqCst) == epoch && !engine.talking() {
+                        engine.earcon(false);
+                    }
+                }
+            });
+    }
+
     /// Один разговор от слова (или кнопки) до тишины.
-    fn converse(self: &Arc<Self>, by_word: bool, sure: bool, preroll: Vec<i16>, clip: Vec<i16>) {
+    /// Возвращает `Some(VoiceFailure)` только при реальном сбое после всех автопереключений.
+    fn converse(self: &Arc<Self>, by_word: bool, sure: bool, preroll: Vec<i16>, clip: Vec<i16>) -> Option<crate::voice_error::VoiceFailure> {
         let s = self.store.get();
         let p = s.active_profile();
+        let provider_id = if p.is_classic() {
+            "classic"
+        } else {
+            match p.engine.as_str() {
+                "" | "live" => "openai",
+                "eleven_realtime" => "elevenlabs",
+                id => id,
+            }
+        };
         let missing = profile_missing(&self.host, &s, &p);
         if !missing.is_empty() {
             self.journal.fail(&missing);
-            return;
+            return Some(crate::voice_error::classify(
+                provider_id,
+                crate::voice_error::Stage::Config,
+                &missing,
+                None,
+                false,
+            ));
+        }
+        if !p.is_classic() && p.engine == "gemini" {
+            let all_keys = crate::gemini_pool::effective_keys(&s.gemini_keys, &s.gemini_key);
+            let models = crate::gemini_pool::selected_live_models(&p);
+            let now = crate::gemini_pool::now_unix();
+            if self.gemini_pool.candidates(&all_keys, &s.gemini_key, &models, now).is_empty() {
+                let tz = self.store.timezone();
+                let failure = self.gemini_pool.all_exhausted_failure(&all_keys, &models, now, &tz);
+                log::warn!("Gemini: {} | Что делать: {}", failure.detail, failure.action);
+                self.journal.fail(&failure.detail);
+                return Some(failure);
+            }
         }
         {
             let t = self.tools.clone();
@@ -800,6 +952,8 @@ impl Engine {
         let mut sess: Option<Arc<dyn Session>> = None;
         let mut out = None;
         let mut speaking = false;
+        let mut answered = false;
+        let mut user_spoke = !by_word;
         let mut checked = 0i64;
         let mut checked_text = String::new();
         let opening_at = Instant::now();
@@ -808,7 +962,7 @@ impl Engine {
         let _ = (sure, &clip);
 
         // открыть разговор с моделью и отдать ему весь звук с момента слова
-        let open = |sess: &mut Option<Arc<dyn Session>>, out: &mut Option<std::sync::mpsc::Receiver<Vec<i16>>>, ready_at: &mut Instant| -> bool {
+        let open = |sess: &mut Option<Arc<dyn Session>>, out: &mut Option<std::sync::mpsc::Receiver<Vec<i16>>>, ready_at: &mut Instant| -> Result<(), Option<crate::voice_error::VoiceFailure>> {
             if by_word {
                 self.leds.set(Mode::Thinking); // соединяюсь с моделью — бегущий огонёк
             }
@@ -846,16 +1000,30 @@ impl Engine {
                 self.play_wake_reply(&sample, &p.engine, opening_at);
             }
             if self.st.lock().unwrap().aborted {
-                return false;
+                return Err(None);
             }
-            if let Err(e) = x.ready(Duration::from_secs(12)) {
+            let ready_timeout = Duration::from_secs(if p.engine == "gemini" { 22 } else { 12 });
+            if let Err(e) = x.ready(ready_timeout) {
+                if self.st.lock().unwrap().aborted {
+                    return Err(None);
+                }
                 log::info!("разговор не открылся: {e}");
                 x.dialog().finish_turn(&format!("разговор не открылся: {}", short(&e)));
-                return false;
+                let vpn_blocked = matches!(self.proxy.route(provider_id), crate::vpn::Route::Blocked(_));
+                let failure = x.last_failure().unwrap_or_else(|| {
+                    crate::voice_error::classify(provider_id, crate::voice_error::Stage::Connect, &e, None, vpn_blocked)
+                });
+                return Err(Some(failure));
             }
             if let Err(e) = self.start_voice(&*x) {
                 x.dialog().finish_turn(&format!("динамик: {e}"));
-                return false;
+                return Err(Some(crate::voice_error::classify(
+                    provider_id,
+                    crate::voice_error::Stage::Audio,
+                    &e,
+                    None,
+                    false,
+                )));
             }
             *out = x.take_audio();
             *ready_at = Instant::now();
@@ -864,16 +1032,17 @@ impl Engine {
             }
             x.dialog().touch();
             self.leds.set(Mode::Listening);
-            true
+            Ok(())
         };
         let close = |sess: &Option<Arc<dyn Session>>| {
             if let Some(x) = sess {
                 x.close();
             }
         };
-        if !open(&mut sess, &mut out, &mut ready_at) {
+        if let Err(failure) = open(&mut sess, &mut out, &mut ready_at) {
+            self.player.stop(true);
             close(&sess);
-            return;
+            return failure;
         }
         let x = sess.clone().unwrap();
         let out = out.unwrap();
@@ -882,8 +1051,32 @@ impl Engine {
             match out.recv_timeout(Duration::from_millis(20)) {
                 Err(RecvTimeoutError::Disconnected) => {
                     self.player.stop(true);
+                    let aborted = self.st.lock().unwrap().aborted || x.dialog().close_requested();
+                    if aborted {
+                        x.dialog().finish_turn("");
+                        close(&sess);
+                        return None;
+                    }
+                    if let Some(failure) = x.last_failure() {
+                        x.dialog().finish_turn(&failure.detail);
+                        close(&sess);
+                        return Some(failure);
+                    }
+                    if !answered && (user_spoke || x.dialog().heard_input_since(opening_at) || x.dialog().user_turns() > 0) {
+                        let failure = crate::voice_error::classify(
+                            provider_id,
+                            crate::voice_error::Stage::Stream,
+                            "Голосовое соединение неожиданно закрылось",
+                            None,
+                            false,
+                        );
+                        x.dialog().finish_turn(&failure.detail);
+                        close(&sess);
+                        return Some(failure);
+                    }
                     x.dialog().finish_turn("");
-                    return close(&sess);
+                    close(&sess);
+                    return None;
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Ok(pcm) => {
@@ -895,6 +1088,7 @@ impl Engine {
                             self.st.lock().unwrap().echo.played(Instant::now(), &pcm, x.rate());
                         }
                         if loud(&pcm) {
+                            answered = true;
                             if p.engine == "gemini" && last_voice.is_none() {
                                 log::info!("Gemini: первый голос через {:.2} с от открытия разговора", opening_at.elapsed().as_secs_f64());
                             }
@@ -919,12 +1113,16 @@ impl Engine {
                 log::info!("разговор: музыка включена — закрываю разговор");
                 self.player.stop(true);
                 x.dialog().finish_turn("");
-                return close(&sess);
+                close(&sess);
+                return None;
             }
             if tick.elapsed() < Duration::from_millis(100) {
                 continue;
             }
             tick = Instant::now();
+            if x.dialog().heard_input_since(opening_at) || x.dialog().user_turns() > 0 {
+                user_spoke = true;
+            }
             let stopped = {
                 let st = self.st.lock().unwrap();
                 st.aborted || !st.live.as_ref().is_some_and(|l| same(l, &x))
@@ -932,7 +1130,8 @@ impl Engine {
             if stopped {
                 self.player.stop(true);
                 x.dialog().finish_turn("");
-                return close(&sess);
+                close(&sess);
+                return None;
             }
             // разговор открыт сразу по слову, а человек так ничего и не сказал — слово сработало зря
             if by_word && checked == 0 && x.dialog().user_turns() == 0
@@ -944,7 +1143,8 @@ impl Engine {
                 self.player.stop(true);
                 x.dialog().annotate("ложное срабатывание", "");
                 x.dialog().finish_turn("");
-                return close(&sess);
+                close(&sess);
+                return None;
             }
             let (id, text, since) = x.dialog().utterance();
             if id != 0 && (id != checked || text != checked_text) && !x.handles_commands() {
@@ -964,7 +1164,8 @@ impl Engine {
                             log::info!("уточнение команды: {error}");
                         }
                     } else if self.handle(&x, &text, "модель") {
-                        return close(&sess);
+                        close(&sess);
+                        return None;
                     }
                 }
             }
@@ -972,7 +1173,8 @@ impl Engine {
                 log::info!("разговор: тишина {idle:.0} с — окончен");
                 self.player.finish(Duration::from_secs(3));
                 x.dialog().finish_turn("");
-                return close(&sess);
+                close(&sess);
+                return None;
             }
         }
     }
@@ -1123,7 +1325,7 @@ impl Engine {
         }
         let t0 = Instant::now();
         let sess: Arc<dyn Session> = if p.is_classic() {
-            crate::classic_voice::Classic::open(
+            crate::classic_voice::Classic::open_with(
                 &self.rt,
                 self.host.clone(),
                 self.tools.clone(),
@@ -1132,6 +1334,8 @@ impl Engine {
                 p.clone(),
                 "Ты озвучиваешь готовый текст. Произнеси ровно то, что тебе дали, ничего не добавляя, и замолчи.".into(),
                 self.listener.phrase(),
+                Some(self.gemini_pool.clone()),
+                Some(self.proxy.clone()),
             )
         } else {
             chatgpt::ChatGptSession::open(
@@ -1145,6 +1349,7 @@ impl Engine {
                     journal: Arc::new(Journal::default()),
                     memory: None,
                     mic_boost_db: 0,
+                    proxy: Some(self.proxy.clone()),
                 },
             )
         };
@@ -1224,6 +1429,9 @@ impl Engine {
     pub fn end_chat(&self, reason: &str) {
         self.speech_epoch.fetch_add(1, Ordering::SeqCst);
         self.speech_notify.notify_waiters();
+        if self.error_speaking.load(Ordering::Relaxed) {
+            std::thread::spawn(alice::cancel_vocalize);
+        }
         let sess = {
             let mut st = self.st.lock().unwrap();
             let sess = st.live.take();
@@ -1411,5 +1619,49 @@ mod tests {
         assert!(super::profile_missing(&host, &s, &p).contains("missing-stt"));
         host.stop_all().await;
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn voice_failure_cooldown_deduplicates_and_skips_expected_stops() {
+        let dir = std::env::temp_dir().join(format!("jarvis-vf-{}", crate::settings::rand_hex(6)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = super::Store::open(dir.join("settings.json")).unwrap();
+        let host = super::Host::new(dir.clone(), crate::plugins::Hooks::default());
+        let proxy = crate::vpn::Proxy::new(store.clone());
+        let mic = super::Mic::new(dir.join("mic.sock"), Box::new(|| 0));
+        let player = super::Player::new(Box::new(|| 40), Box::new(|| 1.0));
+        let leds = super::Leds::new(Box::new(crate::settings::default_led));
+        let journal = std::sync::Arc::new(super::Journal::default());
+        let tools = std::sync::Arc::new(super::Tools::new(host.clone(), store.clone()));
+        let (listener, _) = super::Listener::new(&dir, &store, false);
+        let music = std::sync::Arc::new(crate::music::Music::default());
+        let engine = super::Engine::new(
+            tokio::runtime::Handle::current(),
+            store,
+            host,
+            proxy,
+            mic,
+            player,
+            leds,
+            journal,
+            tools,
+            listener,
+            dir.clone(),
+            music,
+        );
+        let t0 = std::time::Instant::now();
+        let mut f = crate::voice_error::classify(
+            "gemini",
+            crate::voice_error::Stage::Connect,
+            "gemini ответил 429 [retry=45s, quota=PerMinute]",
+            None,
+            false,
+        );
+        assert!(engine.should_announce_failure(&f, t0));
+        assert!(!engine.should_announce_failure(&f, t0 + std::time::Duration::from_secs(5)));
+        assert!(engine.should_announce_failure(&f, t0 + std::time::Duration::from_secs(21)));
+        f.expected = true;
+        assert!(!engine.should_announce_failure(&f, t0 + std::time::Duration::from_secs(50)));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

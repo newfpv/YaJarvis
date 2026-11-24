@@ -46,13 +46,28 @@ impl Provider {
         let nonce=generate_key();let expected=derive_accept_key(nonce.as_bytes());
         let request=self.client_for(network, true)?.get(url).header("Connection","Upgrade").header("Upgrade","websocket").header("Sec-WebSocket-Version","13").header("Sec-WebSocket-Key",nonce);
         let request=if self.id=="gemini"{request}else if let Some(secret)=secret{request.bearer_auth(secret)}else{self.authenticate(request,key)};
-        let response=request.send().await.map_err(|_|"Не подключиться к голосовому провайдеру")?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| classify_net_error("Не подключиться к голосовому провайдеру", &e))?;
         if response.status()!=101 || response.headers().get("Sec-WebSocket-Accept").and_then(|h|h.to_str().ok())!=Some(expected.as_str()) || response.headers().contains_key("Sec-WebSocket-Extensions") || response.headers().contains_key("Sec-WebSocket-Protocol"){
             let status = response.status();
+            let retry_after = header_retry_after(response.headers());
+            let mut response = response;
+            let bytes = read_body(&mut response, 16 * 1024).await.unwrap_or_default();
+            let detail = format_http_error_detail(key, retry_after, &bytes);
             if self.id == "gemini" && status.as_u16() == 404 {
-                return Err("Gemini Live вернул HTTP 404 на адресе голосового WebSocket".into());
+                return Err(if detail.is_empty() {
+                    "Gemini Live вернул HTTP 404 на адресе голосового WebSocket".into()
+                } else {
+                    format!("Gemini Live вернул HTTP 404 на адресе голосового WebSocket: {detail}")
+                });
             }
-            return Err(format!("{}: голосовой WebSocket отклонён (HTTP {})", self.id, status.as_u16()));
+            return Err(if detail.is_empty() {
+                format!("{}: голосовой WebSocket отклонён (HTTP {})", self.id, status.as_u16())
+            } else {
+                format!("{}: голосовой WebSocket отклонён (HTTP {}) {detail}", self.id, status.as_u16())
+            });
         }
         let upgraded=response.upgrade().await.map_err(|_|"Обрыв голосового соединения")?;
         let config=WebSocketConfig::default().max_message_size(Some(4*1024*1024)).max_frame_size(Some(4*1024*1024)).write_buffer_size(16*1024).max_write_buffer_size(256*1024);
@@ -130,11 +145,10 @@ impl Provider {
             },
             _=>return Err(format!("{} не поддерживает операцию {op}",self.id)),
         };
-        let send_error = |error: reqwest::Error| {
-            if error.is_timeout() { "Провайдер не ответил вовремя" } else { "Нет соединения с провайдером" }.to_string()
-        };
+        let send_error = |error: reqwest::Error| classify_net_error("Нет соединения с провайдером", &error);
         let mut response = self.authenticate(request, key).send().await.map_err(send_error)?;
         let mut status = response.status();
+        let mut retry_after = header_retry_after(response.headers());
         let limit=if binary {16*1024*1024}else{4*1024*1024};
         let mut bytes = read_body(&mut response, limit).await?;
         if self.id == "gemini" && op == "text" && gemini_rejected_key(status, &bytes) {
@@ -145,13 +159,12 @@ impl Provider {
                 .json(&params["body"])
                 .send().await.map_err(send_error)?;
             status = response.status();
+            retry_after = header_retry_after(response.headers());
             bytes = read_body(&mut response, limit).await?;
         }
         if !status.is_success(){
-            let data:Value=serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-            let message=data.pointer("/error/message").or_else(||data.pointer("/detail/message")).and_then(Value::as_str).unwrap_or("");
-            let message=message.replace(key,"***").chars().take(240).collect::<String>();
-            return Err(format!("{} ответил {}: {message}",self.id,status.as_u16()));
+            let detail = format_http_error_detail(key, retry_after, &bytes);
+            return Err(format!("{} ответил {}: {detail}",self.id,status.as_u16()));
         }
         if binary {if bytes.len()%2!=0{return Err("Неверный PCM от провайдера".into());}return Ok(json!({"audio":STANDARD.encode(bytes),"rate":24000}));}
         let value:Value=serde_json::from_slice(&bytes).map_err(|_|"Провайдер вернул неверный JSON")?;
@@ -160,6 +173,86 @@ impl Provider {
             if !valid{return Err("Провайдер не подтвердил API-ключ".into());}
         }
         Ok(value)
+    }
+}
+
+fn classify_net_error(prefix: &str, error: &reqwest::Error) -> String {
+    use std::error::Error as _;
+    let mut detail = error.to_string().to_ascii_lowercase();
+    let mut src = error.source();
+    while let Some(s) = src {
+        detail.push(' ');
+        detail.push_str(&s.to_string().to_ascii_lowercase());
+        src = s.source();
+    }
+    if error.is_timeout() {
+        format!("{prefix}: провайдер не ответил вовремя")
+    } else if detail.contains("socks") || detail.contains("proxy") {
+        format!("{prefix}: ошибка VPN-прокси")
+    } else if detail.contains("dns") || detail.contains("lookup") || detail.contains("resolve") {
+        format!("{prefix}: ошибка DNS")
+    } else if detail.contains("tls")
+        || detail.contains("handshake")
+        || detail.contains("certificate")
+        || detail.contains("ssl")
+    {
+        format!("{prefix}: ошибка TLS-соединения")
+    } else {
+        prefix.to_string()
+    }
+}
+
+fn header_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let raw = headers.get("retry-after")?.to_str().ok()?.trim();
+    raw.parse::<u64>().ok().filter(|&s| s > 0)
+}
+
+fn format_http_error_detail(key: &str, retry_after: Option<u64>, bytes: &[u8]) -> String {
+    let data: Value = serde_json::from_slice(bytes).unwrap_or(Value::Null);
+    let mut tags = Vec::new();
+    if let Some(secs) = retry_after {
+        tags.push(format!("retry={secs}s"));
+    }
+    if let Some(details) = data.pointer("/error/details").and_then(Value::as_array) {
+        for detail in details {
+            if let Some(delay) = detail.get("retryDelay").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                if !tags.iter().any(|t| t.starts_with("retry=")) {
+                    tags.push(format!("retry={delay}"));
+                }
+            }
+            if let Some(reason) = detail.get("reason").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                tags.push(format!("reason={reason}"));
+            }
+            if let Some(violations) = detail.get("violations").and_then(Value::as_array) {
+                for v in violations.iter().take(2) {
+                    if let Some(qid) = v.get("quotaId").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                        tags.push(format!("quota={qid}"));
+                    }
+                    if let Some(limit) = v.get("quotaValue").and_then(Value::as_str).filter(|s| *s == "0") {
+                        tags.push(format!("limit: {limit}"));
+                    }
+                }
+            }
+        }
+    }
+    if let Some(status) = data.pointer("/error/status").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+        if !tags.iter().any(|t| t.contains(status)) {
+            tags.push(status.to_string());
+        }
+    }
+    let message = data
+        .pointer("/error/message")
+        .or_else(|| data.pointer("/detail/message"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .replace(key, "***");
+    let message: String = message.chars().take(220).collect();
+    if tags.is_empty() {
+        message
+    } else if message.is_empty() {
+        format!("[{}]", tags.join(", "))
+    } else {
+        format!("[{}] {message}", tags.join(", "))
     }
 }
 
@@ -233,6 +326,26 @@ mod gemini_tests {
         }).await.unwrap();
         assert!(!gemini_rejected_key(reqwest::StatusCode::BAD_REQUEST,
             br#"{"error":{"message":"Unknown name parameters"}}"#));
+    }
+
+    #[test]
+    fn extracts_retry_after_and_quota_ids_without_leaking_key() {
+        let body = br#"{
+            "error": {
+                "code": 429,
+                "status": "RESOURCE_EXHAUSTED",
+                "message": "Quota exceeded for key AIzaSecretKey999",
+                "details": [
+                    {"@type": "type.googleapis.com/google.rpc.QuotaFailure", "violations": [{"quotaId": "GenerateRequestsPerMinutePerProjectPerModel"}]},
+                    {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "42s"}
+                ]
+            }
+        }"#;
+        let detail = format_http_error_detail("AIzaSecretKey999", None, body);
+        assert!(detail.contains("retry=42s"));
+        assert!(detail.contains("quota=GenerateRequestsPerMinutePerProjectPerModel"));
+        assert!(!detail.contains("AIzaSecretKey999"));
+        assert!(detail.contains("***"));
     }
 }
 

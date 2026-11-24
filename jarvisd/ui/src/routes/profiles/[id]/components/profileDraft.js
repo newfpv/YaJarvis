@@ -27,6 +27,7 @@ export function createProfile(base, state) {
   }
   profile.llm_engine ||= profile.llm_plugin || "";
   profile.llm_model ||= profile.backend_model || "";
+  profile.gemini_models = Array.isArray(profile.gemini_models) ? [...profile.gemini_models] : [];
   if (profile.engine === "classic" && usesOpenAiModel(profile.llm_engine)) {
     profile.backend_model = profile.llm_model || state.backend_models[0] || "";
   }
@@ -41,6 +42,7 @@ export function profilePayload(profile, models) {
     payload.stt_model = models.stt;
     payload.tts_model = models.tts;
     payload.live_model = "";
+    payload.gemini_models = [];
     payload.llm_plugin = builtInLlm.includes(profile.llm_engine) ? "" : profile.llm_engine;
     if (usesOpenAiModel(profile.llm_engine)) {
       payload.llm_model = payload.backend_model = models.backend;
@@ -54,6 +56,7 @@ export function profilePayload(profile, models) {
     payload.llm_model = payload.backend_model = models.backend;
     payload.llm_engine = payload.llm_plugin = profile.llm_plugin || "";
     payload.live_model = models.live;
+    payload.gemini_models = profile.engine === "gemini" ? (models.geminiModels || []) : [];
   }
   const needsElevenVoice = profile.engine === "eleven_realtime" || (profile.engine === "classic" && profile.tts_engine === "elevenlabs");
   if (needsElevenVoice && !payload.tts_voice) throw new Error("Выберите голос ElevenLabs");

@@ -21,6 +21,8 @@ mod journal;
 mod led;
 mod llm;
 mod gemini;
+mod gemini_pool;
+mod voice_error;
 mod cloud_voice;
 mod classic_voice;
 mod net;
@@ -327,6 +329,7 @@ async fn run(f: Flags, store: settings::Store) {
         tokio::runtime::Handle::current(),
         store.clone(),
         host.clone(),
+        proxy.clone(),
         mic,
         player,
         leds,

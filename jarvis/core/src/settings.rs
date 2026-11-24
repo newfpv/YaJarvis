@@ -26,6 +26,10 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LedSettings {
@@ -95,6 +99,8 @@ pub struct Profile {
     pub mode: String,
     pub engine: String,
     pub live_model: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "nd")]
+    pub gemini_models: Vec<String>,
     pub voice: String,
     pub backend_model: String,
     pub effort: String,
@@ -302,6 +308,8 @@ pub struct Settings {
 
     pub wake_enabled: bool,
     pub wake_reply_enabled: bool,
+    #[serde(default = "default_true")]
+    pub voice_error_alice: bool,
     pub wake_profile: String,
     pub wake_check: bool,
     pub wake_sensitivity: i64,
@@ -387,6 +395,7 @@ impl Default for Settings {
             live_voices: vec![],
             wake_enabled: true,
             wake_reply_enabled: true,
+            voice_error_alice: true,
             wake_profile: String::new(),
             wake_check: false,
             wake_sensitivity: 5,

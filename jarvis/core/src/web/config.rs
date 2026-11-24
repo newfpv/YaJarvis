@@ -39,6 +39,7 @@ fn patch_settings(s: &mut Settings, v: &Value) -> Result<(), std::io::Error> {
     const ALLOWED: &[&str] = &[
         "wake_enabled",
         "wake_reply_enabled",
+        "voice_error_alice",
         "wake_check",
         "vpn",
         "wake_sensitivity",
@@ -192,6 +193,27 @@ pub async fn profile(State(app): State<App>, Json(mut p): Json<Profile>) -> Resp
     for m in [&p.stt_model, &p.llm_model, &p.tts_model] {
         if m.len() > 160 || m.chars().any(|c| c.is_control() || c.is_whitespace()) {
             return bad("Некорректное имя модели");
+        }
+    }
+    let mut clean_gemini_models = Vec::new();
+    for m in &p.gemini_models {
+        let m = m.trim();
+        if m.is_empty() {
+            continue;
+        }
+        if m.len() > 160 || m.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            return bad("Некорректное имя модели Gemini");
+        }
+        if !clean_gemini_models.iter().any(|x| x == m) {
+            clean_gemini_models.push(m.to_string());
+        }
+    }
+    p.gemini_models = clean_gemini_models;
+    if p.mode != "classic" && p.engine == "gemini" {
+        if !p.gemini_models.is_empty() {
+            p.live_model = p.gemini_models[0].clone();
+        } else if !p.live_model.trim().is_empty() {
+            p.live_model = p.live_model.trim().to_string();
         }
     }
     if p.mode != "classic" {

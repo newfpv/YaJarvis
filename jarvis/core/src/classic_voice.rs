@@ -9,14 +9,24 @@ pub struct Classic {
     dialog:Dialog,frames:mpsc::Sender<Vec<i16>>,say:mpsc::Sender<String>,
     out:Mutex<Option<SyncSender<Vec<i16>>>>,audio:Mutex<Option<Receiver<Vec<i16>>>>,
     closed:AtomicBool,generation:AtomicU64,interrupted:AtomicBool,stop:tokio::sync::Notify,
+    last_failure:Mutex<Option<crate::voice_error::VoiceFailure>>,
 }
-struct Context {host:Arc<Host>,tools:Arc<Tools>,settings:Settings,profile:Profile,instructions:String,phrase:String,history:Mutex<Vec<crate::llm::Turn>>}
+struct Context {
+    host:Arc<Host>,tools:Arc<Tools>,settings:Settings,profile:Profile,instructions:String,phrase:String,
+    history:Mutex<Vec<crate::llm::Turn>>,
+    gemini_pool:Option<Arc<crate::gemini_pool::GeminiPool>>,
+    proxy:Option<Arc<crate::vpn::Proxy>>,
+}
 impl Classic {
     pub fn open(rt:&tokio::runtime::Handle,host:Arc<Host>,tools:Arc<Tools>,journal:Arc<Journal>,settings:Settings,profile:Profile,instructions:String,phrase:String)->Arc<Self>{
+        Self::open_with(rt,host,tools,journal,settings,profile,instructions,phrase,None,None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with(rt:&tokio::runtime::Handle,host:Arc<Host>,tools:Arc<Tools>,journal:Arc<Journal>,settings:Settings,profile:Profile,instructions:String,phrase:String,gemini_pool:Option<Arc<crate::gemini_pool::GeminiPool>>,proxy:Option<Arc<crate::vpn::Proxy>>)->Arc<Self>{
         let (out,audio)=sync_channel(64);let (frames,mut input)=mpsc::channel(64);let (say,mut messages)=mpsc::channel(8);
         let model={let m=profile.effective_llm_model();let e=profile.effective_llm_engine();if !m.is_empty(){m}else if !e.is_empty(){e}else{&profile.backend_model}};
-        let me=Arc::new(Self{dialog:Dialog::new(journal,"классический",model),frames,say,out:Mutex::new(Some(out)),audio:Mutex::new(Some(audio)),closed:AtomicBool::new(false),generation:AtomicU64::new(0),interrupted:AtomicBool::new(false),stop:tokio::sync::Notify::new()});
-        let actor=me.clone();let context=Arc::new(Context{host,tools,settings,profile,instructions,phrase,history:Mutex::new(Vec::new())});
+        let me=Arc::new(Self{dialog:Dialog::new(journal,"классический",model),frames,say,out:Mutex::new(Some(out)),audio:Mutex::new(Some(audio)),closed:AtomicBool::new(false),generation:AtomicU64::new(0),interrupted:AtomicBool::new(false),stop:tokio::sync::Notify::new(),last_failure:Mutex::new(None)});
+        let actor=me.clone();let context=Arc::new(Context{host,tools,settings,profile,instructions,phrase,history:Mutex::new(Vec::new()),gemini_pool,proxy});
         rt.spawn(async move {
             let mut vad=Capture::default();let mut tasks=tokio::task::JoinSet::new();
             loop {tokio::select! {
@@ -26,7 +36,15 @@ impl Classic {
                     tasks.abort_all();let generation=actor.generation.fetch_add(1,Ordering::SeqCst)+1;
                     let me=actor.clone();let context=context.clone();tasks.spawn(async move{me.speak(&context,&text,generation).await});
                 },
-                result=tasks.join_next(),if !tasks.is_empty()=>{if let Some(Ok(Err(error)))=result{actor.dialog.finish_turn(&error);}actor.dialog.working(-1);},
+                result=tasks.join_next(),if !tasks.is_empty()=>{
+                    actor.dialog.working(-1);
+                    if let Some(Ok(Err(error)))=result {
+                        actor.dialog.finish_turn(&error);
+                        if actor.last_failure.lock().unwrap().is_some() {
+                            break;
+                        }
+                    }
+                },
                 Some(pcm)=input.recv()=>{
                     let starting=!vad.speaking && crate::engine::loud(&pcm);
                     if starting {tasks.abort_all();actor.generation.fetch_add(1,Ordering::SeqCst);actor.interrupted.store(true,Ordering::SeqCst);}
@@ -39,6 +57,10 @@ impl Classic {
             tasks.shutdown().await;actor.out.lock().unwrap().take();
         });me
     }
+    fn record_failure(&self, context: &Context, provider: &str, stage: crate::voice_error::Stage, err: &str) {
+        let vpn_blocked = context.proxy.as_ref().is_some_and(|p| matches!(p.route(provider), crate::vpn::Route::Blocked(_)));
+        *self.last_failure.lock().unwrap() = Some(crate::voice_error::classify(provider, stage, err, None, vpn_blocked));
+    }
     async fn turn(&self,context:&Context,pcm:Vec<i16>,generation:u64)->Result<(),String>{
         let stt=context.profile.effective_stt_engine();
         let wav_b64=B64.encode(wav(&pcm));
@@ -46,9 +68,15 @@ impl Classic {
             "openai"|"elevenlabs"=>{
                 let key=if stt=="openai"{&context.settings.openai_key}else{&context.settings.elevenlabs_key};
                 let model=if context.profile.stt_model.is_empty(){if stt=="openai"{"gpt-4o-mini-transcribe"}else{"scribe_v2"}}else{&context.profile.stt_model};
-                context.host.provider(stt)?.request(stt,json!({"op":"stt","key":key,"model":model,"language":context.settings.language,"audio":wav_b64}),Duration::from_secs(45)).await?
+                match context.host.provider(stt)?.request(stt,json!({"op":"stt","key":key,"model":model,"language":context.settings.language,"audio":wav_b64}),Duration::from_secs(45)).await {
+                    Ok(v) => v,
+                    Err(e) => { self.record_failure(context, stt, crate::voice_error::Stage::Connect, &e); return Err(e); }
+                }
             },
-            id=>context.host.plugin_stt(id,json!({"audio_b64":wav_b64,"format":"wav","rate":16000,"model":context.profile.stt_model,"language":context.settings.language})).await?,
+            id=>match context.host.plugin_stt(id,json!({"audio_b64":wav_b64,"format":"wav","rate":16000,"model":context.profile.stt_model,"language":context.settings.language})).await {
+                Ok(v) => v,
+                Err(e) => { self.record_failure(context, id, crate::voice_error::Stage::Connect, &e); return Err(e); }
+            },
         };
         let text=response.as_str().or_else(||response["text"].as_str()).unwrap_or("").trim();if text.is_empty(){return Ok(());}
         self.dialog.on_user(text);
@@ -73,7 +101,14 @@ impl Classic {
         let answer=if let Some(answer)=context.host.command(command).await{answer}else if let Some(answer)=context.tools.ha_vacuum(command).await{answer}else if let Some(answer)=context.tools.smartlife_fast(command).await{answer}else if let Some(answer)=context.tools.fast(command).await{answer}else{
             let history=context.history.lock().unwrap().clone();
             let (extra,defs)=context.tools.prepare().await;
-            let reply=crate::llm::ask_with_history_detail(&context.host,&context.settings,&context.profile,&format!("{}\n{}\n{extra}",context.instructions,crate::rules::BACKEND_RULES),&history,text,&context.tools,defs).await?;
+            let llm_provider = {
+                let e = context.profile.effective_llm_engine();
+                if e.is_empty() { "classic" } else { e }
+            };
+            let reply=match crate::llm::ask_with_history_detail_pool(&context.host,&context.settings,&context.profile,&format!("{}\n{}\n{extra}",context.instructions,crate::rules::BACKEND_RULES),&history,text,&context.tools,defs,context.gemini_pool.as_deref()).await {
+                Ok(r) => r,
+                Err(e) => { self.record_failure(context, llm_provider, crate::voice_error::Stage::Connect, &e); return Err(e); }
+            };
             close_after = reply.close_dialog && !crate::music::wants_keep_talking(text);
             if self.generation.load(Ordering::SeqCst)==generation{
                 let mut h=context.history.lock().unwrap();
@@ -99,14 +134,23 @@ impl Classic {
             "openai"=>{
                 let model=if context.profile.tts_model.is_empty(){"gpt-4o-mini-tts"}else{&context.profile.tts_model};
                 let body=json!({"model":model,"voice":voice,"input":text});
-                context.host.provider("openai")?.request("openai",json!({"op":"tts","key":&context.settings.openai_key,"voice":voice,"body":body}),Duration::from_secs(60)).await?
+                match context.host.provider("openai")?.request("openai",json!({"op":"tts","key":&context.settings.openai_key,"voice":voice,"body":body}),Duration::from_secs(60)).await {
+                    Ok(v) => v,
+                    Err(e) => { self.record_failure(context, "openai", crate::voice_error::Stage::Connect, &e); return Err(e); }
+                }
             },
             "elevenlabs"=>{
                 let model=if context.profile.tts_model.is_empty(){crate::settings::ELEVEN_DEFAULT_MODEL}else{&context.profile.tts_model};
                 let body=json!({"text":text,"model_id":model});
-                context.host.provider("elevenlabs")?.request("elevenlabs",json!({"op":"tts","key":&context.settings.elevenlabs_key,"voice":voice,"body":body}),Duration::from_secs(60)).await?
+                match context.host.provider("elevenlabs")?.request("elevenlabs",json!({"op":"tts","key":&context.settings.elevenlabs_key,"voice":voice,"body":body}),Duration::from_secs(60)).await {
+                    Ok(v) => v,
+                    Err(e) => { self.record_failure(context, "elevenlabs", crate::voice_error::Stage::Connect, &e); return Err(e); }
+                }
             },
-            id=>context.host.plugin_tts(id,json!({"text":text,"voice":voice,"model":context.profile.tts_model,"language":context.settings.language})).await?,
+            id=>match context.host.plugin_tts(id,json!({"text":text,"voice":voice,"model":context.profile.tts_model,"language":context.settings.language})).await {
+                Ok(v) => v,
+                Err(e) => { self.record_failure(context, id, crate::voice_error::Stage::Connect, &e); return Err(e); }
+            },
         };
         let b64=result["audio"].as_str().or_else(||result["audio_b64"].as_str()).ok_or("Нет голоса TTS")?;
         let bytes=B64.decode(b64).map_err(|_|"Неверный голос TTS")?;
@@ -136,6 +180,7 @@ impl Session for Classic {
     fn close(&self){self.closed.store(true,Ordering::SeqCst);self.stop.notify_one();}
     fn dialog(&self)->&Dialog{&self.dialog}
     fn interrupted(&self)->bool{self.interrupted.swap(false,Ordering::SeqCst)}
+    fn last_failure(&self)->Option<crate::voice_error::VoiceFailure>{self.last_failure.lock().unwrap().clone()}
 }
 #[derive(Default)]struct Capture{preroll:Vec<i16>,speech:Vec<i16>,silence:usize,speaking:bool}
 impl Capture {
@@ -191,7 +236,7 @@ fn wav(pcm:&[i16])->Vec<u8>{
         let profile=Profile{mode:"classic".into(),engine:"classic".into(),stt_engine:"my-stt".into(),stt_model:"whisper-x".into(),llm_engine:"my-llm".into(),llm_model:"custom-m".into(),tts_engine:"my-tts".into(),tts_voice:"v1".into(),..Default::default()};
         let sess=Classic::open(&tokio::runtime::Handle::current(),host.clone(),tools.clone(),journal.clone(),Settings::default(),profile.clone(),"inst".into(),"Джарвис".into());
         let rx=sess.take_audio().unwrap();
-        let ctx=Context{host:host.clone(),tools,settings:Settings::default(),profile,instructions:"inst".into(),phrase:"Джарвис".into(),history:Mutex::new(Vec::new())};
+        let ctx=Context{host:host.clone(),tools,settings:Settings::default(),profile,instructions:"inst".into(),phrase:"Джарвис".into(),history:Mutex::new(Vec::new()),gemini_pool:None,proxy:None};
         sess.turn(&ctx,vec![0;3200],0).await.unwrap();
         let pcm1=rx.recv_timeout(Duration::from_secs(2)).unwrap();assert_eq!(pcm1.len(),3);
         sess.turn(&ctx,vec![0;3200],0).await.unwrap();

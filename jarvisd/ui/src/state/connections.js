@@ -382,8 +382,27 @@ export async function serviceAction(t, root, redraw) {
     catch (err) { t.checked = !on; toast(err.message, true); }
     return;
   }
-  const gk = t.closest("[data-gk-remove]");
-  if (gk) { if (confirm("Убрать этот ключ Google с колонки?")) act(gk, async () => { await api("PUT", "/api/gemini-keys", { remove: +gk.dataset.gkRemove }); await redraw(); }, "Ключ убран"); return; }
+  const gk = t.closest("[data-gk-remove], [data-gk-reset], [data-gk-reset-all], [data-gk-activate]");
+  if (gk) {
+    if (gk.dataset.gkResetAll !== undefined) {
+      if (confirm("Сбросить паузы по лимитам для всех ключей Google?")) {
+        return act(gk, async () => { await api("PUT", "/api/gemini-keys", { reset_all: true }); await redraw(); }, "Лимиты всех ключей сброшены");
+      }
+      return;
+    }
+    if (gk.dataset.gkRemove !== undefined) {
+      if (confirm("Убрать этот ключ Google с колонки?")) {
+        return act(gk, async () => { await api("PUT", "/api/gemini-keys", { remove: +gk.dataset.gkRemove }); await redraw(); }, "Ключ убран");
+      }
+      return;
+    }
+    if (gk.dataset.gkReset !== undefined) {
+      return act(gk, async () => { await api("PUT", "/api/gemini-keys", { reset: +gk.dataset.gkReset }); await redraw(); }, "Лимиты ключа сброшены");
+    }
+    if (gk.dataset.gkActivate !== undefined) {
+      return act(gk, async () => { await api("PUT", "/api/gemini-keys", { activate: +gk.dataset.gkActivate }); await redraw(); }, "Ключ выбран активным");
+    }
+  }
   const ek = t.closest("[data-ek-remove], [data-ek-reset]");
   if (ek) {
     const rm = ek.dataset.ekRemove !== undefined, i = +(rm ? ek.dataset.ekRemove : ek.dataset.ekReset);

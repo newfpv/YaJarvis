@@ -33,6 +33,10 @@ pub trait Session: Send + Sync {
     fn interrupted(&self) -> bool {
         false
     }
+    /// Последний типизированный сбой голосовой сессии (если разговор прервался из-за ошибки).
+    fn last_failure(&self) -> Option<crate::voice_error::VoiceFailure> {
+        None
+    }
 }
 
 #[derive(Default)]

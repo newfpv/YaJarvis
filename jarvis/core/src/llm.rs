@@ -4,7 +4,12 @@ use serde_json::{Value,json};
 use std::time::Duration;
 
 fn configured<'a>(s:&'a Settings,id:&str)->&'a str {
-    match id{"openai"=>&s.openai_key,"gemini"=>&s.gemini_key,"grok"=>&s.grok_key,_=>""}
+    match id{
+        "openai"=>&s.openai_key,
+        "gemini"=>if !s.gemini_key.is_empty(){&s.gemini_key}else{s.gemini_keys.first().map(String::as_str).unwrap_or("")},
+        "grok"=>&s.grok_key,
+        _=>""
+    }
 }
 
 pub const MEMORY_PROVIDERS: [&str; 3] = ["chatgpt", "gemini", "openai"];
@@ -57,6 +62,12 @@ pub async fn ask(host:&Host,s:&Settings,p:&Profile,instructions:&str,text:&str,t
     ask_with_history(host, s, p, instructions, &[], text, tools, defs).await
 }
 
+pub async fn ask_with_pool(host:&Host,s:&Settings,p:&Profile,instructions:&str,text:&str,tools:&Tools,defs:Vec<Value>,gemini_pool:Option<&crate::gemini_pool::GeminiPool>)->Result<String,String>{
+    ask_with_history_detail_pool(host, s, p, instructions, &[], text, tools, defs, gemini_pool)
+        .await
+        .map(|reply| reply.text)
+}
+
 pub async fn ask_with_history(host:&Host,s:&Settings,p:&Profile,instructions:&str,history:&[Turn],text:&str,tools:&Tools,defs:Vec<Value>)->Result<String,String>{
     ask_with_history_detail(host, s, p, instructions, history, text, tools, defs)
         .await
@@ -64,6 +75,10 @@ pub async fn ask_with_history(host:&Host,s:&Settings,p:&Profile,instructions:&st
 }
 
 pub async fn ask_with_history_detail(host:&Host,s:&Settings,p:&Profile,instructions:&str,history:&[Turn],text:&str,tools:&Tools,defs:Vec<Value>)->Result<AskReply,String>{
+    ask_with_history_detail_pool(host, s, p, instructions, history, text, tools, defs, None).await
+}
+
+pub async fn ask_with_history_detail_pool(host:&Host,s:&Settings,p:&Profile,instructions:&str,history:&[Turn],text:&str,tools:&Tools,defs:Vec<Value>,gemini_pool:Option<&crate::gemini_pool::GeminiPool>)->Result<AskReply,String>{
     let explicit = p.effective_llm_engine();
     if !explicit.is_empty() && !matches!(explicit, "openai" | "live" | "chatgpt" | "gemini" | "grok") {
         return ask_plugin(host, explicit, p.effective_llm_model(), instructions, history, text, tools, &defs).await;
@@ -133,7 +148,49 @@ pub async fn ask_with_history_detail(host:&Host,s:&Settings,p:&Profile,instructi
             "grok"=>{let tools:Vec<_>=defs.iter().filter(|d|d["type"]=="function").map(|d|json!({"type":"function","function":{"name":d["name"],"description":d["description"],"parameters":d["parameters"]}})).collect();let mut body=json!({"model":model,"messages":messages,"stream":false});if !tools.is_empty(){body["tools"]=tools.into();}body},
             _=>{let mut tools=defs.clone();if p.web_search{tools.push(json!({"type":"web_search"}));}json!({"model":model,"instructions":instructions,"input":input,"tools":tools,"reasoning":{"effort":crate::chatgpt::effort(model,&p.effort)},"store":false,"stream":false})},
         };
-        let response=provider.request(id,json!({"op":"text","key":key,"model":model,"body":body}),Duration::from_secs(60)).await?;
+        let response = if id == "gemini" {
+            let tz = jiff::tz::TimeZone::get(&s.timezone).unwrap_or(jiff::tz::TimeZone::UTC);
+            let all_keys = crate::gemini_pool::effective_keys(&s.gemini_keys, &s.gemini_key);
+            if let Some(pool) = gemini_pool {
+                let cands = pool.candidates(&all_keys, &s.gemini_key, &[model.to_string()], crate::gemini_pool::now_unix());
+                if cands.is_empty() {
+                    let f = pool.all_exhausted_failure(&all_keys, &[model.to_string()], crate::gemini_pool::now_unix(), &tz);
+                    log::warn!("Gemini (текст): {} | Что делать: {}", f.detail, f.action);
+                    return Err(f.detail);
+                }
+                let mut reply = None;
+                for (i, cand) in cands.iter().enumerate() {
+                    match provider.request(id, json!({"op":"text","key":&cand.key,"model":model,"body":body}), Duration::from_secs(60)).await {
+                        Ok(val) => {
+                            pool.record_success(&cand.key, model);
+                            reply = Some(val);
+                            break;
+                        }
+                        Err(err) => {
+                            let failure = crate::voice_error::classify("gemini", crate::voice_error::Stage::Connect, &err, None, false);
+                            if let Some(ev) = pool.record_failure(&cand.key, cand.key_index, model, &failure, crate::gemini_pool::now_unix(), &tz) {
+                                if let Some(next) = cands.get(i + 1) {
+                                    log::warn!("Gemini (текст): {}. Переключаюсь на ключ #{} ({}).", ev.summary, next.key_index + 1, next.tail);
+                                    continue;
+                                }
+                                let final_f = pool.all_exhausted_failure(&all_keys, &[model.to_string()], crate::gemini_pool::now_unix(), &tz);
+                                log::warn!("Gemini (текст): {} | Что делать: {}", final_f.detail, final_f.action);
+                                return Err(final_f.detail);
+                            }
+                            return Err(err);
+                        }
+                    }
+                }
+                match reply {
+                    Some(v) => v,
+                    None => return Err("Все ключи Gemini в лимите".into()),
+                }
+            } else {
+                provider.request(id, json!({"op":"text","key":key,"model":model,"body":body}), Duration::from_secs(60)).await?
+            }
+        } else {
+            provider.request(id, json!({"op":"text","key":key,"model":model,"body":body}), Duration::from_secs(60)).await?
+        };
         let (answer,calls)=decode(id,&response)?;
         if response["candidates"][0].get("groundingMetadata").is_some()
             || response["output"].as_array().is_some_and(|items| items.iter().any(|item| item["type"] == "web_search_call"))

@@ -31,7 +31,7 @@ impl Engine {
             if let Some(answer)=self.tools.fast(command).await{return Ok(answer);}
             let (context,defs)=self.tools.prepare().await;
             let instructions=format!("{}{}{}\n{context}",self.instructions(&s,&p),rules::TEXT_RULES,rules::BACKEND_RULES);
-            crate::llm::ask(&self.host,&s,&p,&instructions,text,&self.tools,defs).await
+            crate::llm::ask_with_pool(&self.host,&s,&p,&instructions,text,&self.tools,defs,Some(&self.gemini_pool)).await
         };
         let result=tokio::select!{
             value=tokio::time::timeout(Duration::from_secs(90),work)=>value.unwrap_or_else(|_|Err("Запрос не завершился за 90 с".into())),

@@ -180,8 +180,7 @@ impl Records {
                 let mut state = records.offload.lock().unwrap();
                 state.running = false;
                 match result {
-                    Ok((sent, has_more)) => {
-                        state.sent += sent;
+                    Ok((_, has_more)) => {
                         state.error.clear();
                         state.retry_at = None;
                         more = has_more;
@@ -227,6 +226,11 @@ impl Records {
             .await
             .map_err(|e| e.to_string())??;
             sent += 1;
+            {
+                let mut state = self.offload.lock().unwrap();
+                state.sent += 1;
+                state.error.clear();
+            }
         }
         let records = self.clone();
         let has_more = tokio::task::spawn_blocking(move || {
@@ -1094,6 +1098,7 @@ mod tests {
         let snap = records.snapshot(true, 10, false, true).await;
         assert_eq!(snap["local"], 0);
         assert_eq!(snap["remote"], 2);
+        assert_eq!(snap["offload"]["sent"], 2);
         assert_eq!(snap["clips"][0]["remote"], true);
         assert_eq!(snap["clips"][0]["storage"], "yadisk");
 

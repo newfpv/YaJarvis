@@ -176,7 +176,7 @@ curl -fsSL https://github.com/newfpv/YaJarvis/releases/latest/download/install.s
   - **Rust (отдельные процессы):** `homeassistant`, `smartlife` (Tuya LAN + облако), `xiaomi` (Mi Home), `youtube` (музыка и аккаунт), `vpn` (VLESS / REALITY / Vision), `training` (смена фразы и дообучение слова активации).
 - **Плагины сообщества и свои разработки.** Джарвис сам находит открытые плагины на GitHub по теме `yajarvis-plugin` (и категоризирует по `yajarvis-<категория>`), а также умеет ставить любой `.zip`-архив с ПК.
 
-**[Открыть подробную Вики по плагинам →](docs/PLUGINS.md)** *(каталог, разрешения, манифест `plugin.json`, полное Lua API, Rust SDK и публикация в каталог GitHub)*
+**[Открыть подробную Вики по плагинам →](docs/PLUGINS.md)** · **[Спецификация для AI-агентов (`PLUGIN-AGENT.md`) →](docs/PLUGIN-AGENT.md)** *(каталог, манифест `plugin.json`, Lua API, Rust SDK, шаблоны CI и публикация в каталог GitHub)*
 
 ---
 
@@ -253,7 +253,7 @@ curl -fsSL https://github.com/newfpv/YaJarvis/releases/latest/download/install.s
 | Раздел | О чём внутри |
 | :--- | :--- |
 | **[FAQ и бесплатный старт](docs/FAQ.md)** | Бесплатные способы (Gemini Live, пулы ключей, ElevenLabs, OpenRouter `:free`), ChatGPT Plus vs Go/Free, получение ключей, VPN, удаление, сброс пароля |
-| **[Вики по плагинам](docs/PLUGINS.md)** | Каталог 10 официальных плагинов, манифест `plugin.json`, категории, разрешения, Lua 5.4 API, Rust SDK и публикация в каталог GitHub |
+| **[Вики по плагинам](docs/PLUGINS.md)** · **[Для AI-агентов](docs/PLUGIN-AGENT.md)** | Каталог 10 официальных плагинов, манифест `plugin.json`, категории, разрешения, Lua 5.4 API, Rust SDK, шаблоны GitHub Actions и публикация в каталог |
 | **[Справочник Lua API](docs/LUA.md)** | Компактная шпаргалка по методам `jarvis.*`, `chat`, `transcribe`, `speak` и лимитам песочницы |
 | **[Rust-пакеты и модули](docs/NATIVE-PLUGINS.md)** · **[Официальные пакеты](docs/RUST-MODULES.md)** | Создание бинарных плагинов на `jarvis-plugin-sdk` и встраивание модулей в ядро |
 | **[Дообучение слова «Джарвис»](docs/WAKEWORD.md)** · **[Исследование активации](docs/WAKEWORD-RESEARCH.md)** | Сбор записей, разметка и дообучение моделей активации `OWWH`/`OWH2` и `JKWS1` под свой голос |

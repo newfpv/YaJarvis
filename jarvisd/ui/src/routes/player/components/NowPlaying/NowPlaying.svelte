@@ -1,7 +1,18 @@
 <script>
   import { onMount } from "svelte";
   import { icon } from "#helpers/core.js";
-  import { artOf, clockStr, mountPlayback, mountVolume, musicAct, musicLink, setArt } from "#state/player.js";
+  import { speaker } from "#state/panelState.js";
+  import {
+    artOf,
+    clockStr,
+    mountPlayback,
+    mountVolume,
+    musicAct,
+    musicLink,
+    setArt,
+    setYoutubeLike,
+    subscribeLikes,
+  } from "#state/player.js";
   import styles from "./NowPlaying.module.css";
 
   let state = $state.raw(null);
@@ -14,6 +25,7 @@
   let titleWidth = $state(0);
   let textWidth = $state(0);
   let pending = $state(false);
+  let likedSet = $state.raw(new Set());
 
   let track = $derived(state?.track || {});
   let active = $derived(!!(state?.playing || state?.paused));
@@ -28,13 +40,21 @@
   let link = $derived(active ? musicLink(state) : "");
   let overflow = $derived(Math.max(0, textWidth - titleWidth));
   let duration = $derived(state?.dur ? clockStr(state.dur) : "");
+  let youtubeSigned = $derived(
+    Boolean($speaker?.youtube?.plugin && ($speaker?.youtube?.account?.signed_in || $speaker?.youtube?.set)),
+  );
+  let isLiked = $derived(
+    Boolean(!yandex && active && track?.ID && (likedSet.has(track.ID) || state?.liked)),
+  );
 
   onMount(() => {
     const releasePlayback = mountPlayback(seek, time, bars, (snapshot) => { state = snapshot; });
     const releaseVolume = mountVolume(volume, (value) => { level = value; });
+    const releaseLikes = subscribeLikes((ids) => { likedSet = new Set(ids); });
     return () => {
       releasePlayback();
       releaseVolume();
+      releaseLikes();
     };
   });
 
@@ -47,6 +67,16 @@
     pending = true;
     try {
       await musicAct(action, event.currentTarget, { disableControl: false });
+    } finally {
+      pending = false;
+    }
+  }
+
+  async function toggleLike(event) {
+    if (pending || !track?.ID || !youtubeSigned) return;
+    pending = true;
+    try {
+      await setYoutubeLike(track.ID, !isLiked, track, event.currentTarget);
     } finally {
       pending = false;
     }
@@ -95,6 +125,13 @@
           <button class="cbtn" class:on={!!state?.radio} id="pl-radio" type="button" disabled={pending}
             data-tip="Радио: когда очередь кончится, играть похожее" aria-label="Радио" aria-pressed={!!state?.radio}
             onclick={(event) => control(event, "radio")}>{@html icon("radio")}</button>
+          {#if active && track?.ID}
+            <button class="cbtn" class:liked={isLiked} id="pl-like" type="button"
+              disabled={pending || !youtubeSigned}
+              data-tip={!youtubeSigned ? "Войдите в аккаунт YouTube в настройках" : isLiked ? "Убрать лайк" : "Поставить лайк"}
+              aria-label={isLiked ? "Убрать лайк" : "Поставить лайк"} aria-pressed={isLiked}
+              onclick={toggleLike}>{@html icon("heart")}</button>
+          {/if}
         {/if}
         {#if link}
           <button class="cbtn" type="button" disabled={pending} data-tip="Скопировать ссылку" aria-label="Скопировать ссылку"

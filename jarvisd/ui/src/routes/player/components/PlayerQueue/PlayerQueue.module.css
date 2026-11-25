@@ -152,7 +152,8 @@ button.track:not(:disabled) {
   transition: opacity .15s;
 }
 
-.row:is(:hover, :focus-within) .remove {
+.row:is(:hover, :focus-within) .remove,
+.keepVisible {
   opacity: 1;
 }
 

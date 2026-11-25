@@ -3,6 +3,7 @@
   import { musicData } from "#state/player.js";
   import PlayerQueue from "./PlayerQueue/PlayerQueue.svelte";
   import NowPlaying from "./NowPlaying/NowPlaying.svelte";
+  import YouTubeSearch from "./YouTubeSearch/YouTubeSearch.svelte";
   import YouTubeLibrary from "./YouTubeLibrary/YouTubeLibrary.svelte";
 
   onMount(() => { void musicData(); });
@@ -17,4 +18,5 @@
 <div class="cols stagger" id="player-queue">
   <PlayerQueue />
 </div>
+<YouTubeSearch />
 <YouTubeLibrary />

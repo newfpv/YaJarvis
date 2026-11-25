@@ -68,13 +68,17 @@ impl Training {
                 ring.extend_from_slice(&pcm);
                 if !discard {
                     let prob = params["prob"].as_f64().unwrap_or(0.) as f32;
+                    let trigger_tail = params["trigger_tail"].as_u64().unwrap_or(0) as usize;
                     let loud = pcm.iter().any(|sample| !(-600..=600).contains(sample));
                     if let Some(kind) = self.records.sample_kind(hit, prob, loud) {
                         let clip = &ring[ring.len().saturating_sub(RATE * 3)..];
                         if clip.len() >= RATE {
                             let limit = params["limit"].as_i64().unwrap_or(1);
+                            let trigger_ms = (kind != "bg").then(|| {
+                                (clip.len().saturating_sub(trigger_tail) * 1000 / RATE) as u32
+                            });
                             self.records
-                                .save_soon(&rt, kind, clip.to_vec(), prob, limit);
+                                .save_soon(&rt, kind, clip.to_vec(), prob, trigger_ms, limit);
                         }
                     }
                 }

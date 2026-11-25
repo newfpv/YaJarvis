@@ -758,6 +758,8 @@ progress.bar::-moz-progress-bar { background: var(--acc); }
 .cbtn .ic { width: 20px; height: 20px; }
 .cbtn .ic.solid { fill: currentColor; }
 .cbtn.on { color: var(--acc-ink); background: var(--acc-soft); }
+.cbtn.liked, .ib.liked { color: #ff4e45; }
+.cbtn.liked .ic, .ib.liked .ic { fill: currentColor; }
 .cbtn.big { width: 64px; height: 64px; background: var(--acc); color: #fff; box-shadow: 0 10px 26px -10px color-mix(in srgb, var(--acc) 95%, transparent); }
 .cbtn.big:hover { background: var(--acc); filter: brightness(1.08); }
 .cbtn.big .ic { width: 24px; height: 24px; }

@@ -1,9 +1,13 @@
 <script>
+  import { onMount } from "svelte";
   import { icon, toast } from "#helpers/core.js";
   import { speaker } from "#state/panelState.js";
   import {
     music,
     playMusicAction,
+    setYoutubeLike,
+    subscribeLikes,
+    syncLikedIds,
     youtubeLibrary,
     youtubePlaylistItems,
   } from "#state/player.js";
@@ -14,11 +18,13 @@
   let library = $state.raw(null);
   let loading = $state(false);
   let loadError = $state("");
+  let filterText = $state("");
   let selectedPlaylist = $state.raw(null);
   let playlistTracks = $state.raw([]);
   let playlistLoading = $state(false);
   let playlistError = $state("");
   let busy = $state(false);
+  let likedSet = $state.raw(new Set());
   let lastSignedKey = "";
   let librarySeq = 0;
   let playlistSeq = 0;
@@ -42,6 +48,50 @@
   );
   let liked = $derived(library?.liked || []);
   let playlists = $derived(library?.playlists || []);
+  let needle = $derived(filterText.trim().toLowerCase());
+  let filteredLiked = $derived(
+    liked
+      .map((track, index) => ({ track, index }))
+      .filter(({ track }) =>
+        !needle
+        || (track.Title || "").toLowerCase().includes(needle)
+        || (track.Author || "").toLowerCase().includes(needle),
+      ),
+  );
+  let filteredPlaylists = $derived(
+    playlists.filter((pl) =>
+      !needle || (pl.Title || "").toLowerCase().includes(needle),
+    ),
+  );
+  let filteredPlaylistTracks = $derived(
+    playlistTracks
+      .map((track, index) => ({ track, index }))
+      .filter(({ track }) =>
+        !needle
+        || (track.Title || "").toLowerCase().includes(needle)
+        || (track.Author || "").toLowerCase().includes(needle),
+      ),
+  );
+
+  onMount(() => {
+    return subscribeLikes((ids, change) => {
+      likedSet = new Set(ids);
+      if (change?.id && library) {
+        const currentLiked = library.liked || [];
+        const rest = currentLiked.filter((item) => item.ID !== change.id);
+        let nextLiked = rest;
+        if (change.liked) {
+          const entry = {
+            ID: change.id,
+            Title: change.track?.Title || change.id,
+            Author: change.track?.Author || "",
+          };
+          nextLiked = [entry, ...rest];
+        }
+        library = { ...library, liked: nextLiked };
+      }
+    });
+  });
 
   $effect(() => {
     const key = signedKey;
@@ -70,6 +120,9 @@
       if (seq !== librarySeq) return;
       library = data;
       loadError = data?.error || "";
+      if (Array.isArray(data?.liked)) {
+        syncLikedIds(data.liked.map((t) => t.ID));
+      }
       if (refresh && selectedPlaylist) {
         void openPlaylist(selectedPlaylist, true);
       }
@@ -117,8 +170,25 @@
     busy = true;
     void (async () => {
       try {
-        const ok = await music({ action: "queue", query: track.ID });
+        const ok = await music({
+          action: "queue",
+          query: track.ID,
+          title: track.Title || "",
+          author: track.Author || "",
+        });
         if (ok) toast("Добавлено в очередь");
+      } finally {
+        busy = false;
+      }
+    })();
+  }
+
+  function toggleLike(track, nextLiked, event) {
+    if (!track?.ID || busy) return;
+    busy = true;
+    void (async () => {
+      try {
+        await setYoutubeLike(track.ID, nextLiked, track, event?.currentTarget);
       } finally {
         busy = false;
       }
@@ -181,6 +251,33 @@
       <p class={styles.errorNote}>{loadError}</p>
     {/if}
 
+    {#if liked.length || playlists.length || playlistTracks.length}
+      <div class={styles.filterRow}>
+        <label class={styles.filterField}>
+          {@html icon("search")}
+          <input
+            type="text"
+            placeholder={tab === "liked" ? "Фильтр по лайкам…" : selectedPlaylist ? "Фильтр по трекам плейлиста…" : "Фильтр по плейлистам…"}
+            autocomplete="off"
+            aria-label="Фильтр в медиатеке"
+            bind:value={filterText}
+          />
+          {#if filterText}
+            <button
+              class={["ib", styles.filterClear]}
+              type="button"
+              aria-label="Сбросить фильтр"
+              onclick={() => {
+                filterText = "";
+              }}
+            >
+              {@html icon("x")}
+            </button>
+          {/if}
+        </label>
+      </div>
+    {/if}
+
     {#if tab === "liked"}
       {#if loading && !library}
         <p class="empty">Загружаю лайки…</p>
@@ -203,35 +300,50 @@
             {@html icon("shuffle")}<span>Вперемешку</span>
           </button>
         </div>
-        <ul class={[qStyles.list, styles.scrollList]}>
-          {#each liked as track, index}
-            <li class={qStyles.row}>
-              <button
-                class={qStyles.track}
-                type="button"
-                aria-label={`Включить «${track.Title || "…"}»`}
-                disabled={busy || !track.ID}
-                onclick={() => playAction({ action: "liked", index })}
-              >
-                <img class={qStyles.image} src={thumbnail(track)} alt="" loading="lazy" />
-                <span class={qStyles.description}>
-                  <b>{track.Title || "…"}</b>
-                  <span>{track.Author || ""}</span>
-                </span>
-              </button>
-              <button
-                class={["ib", qStyles.remove]}
-                type="button"
-                disabled={busy || !track.ID}
-                aria-label={`Добавить в очередь «${track.Title || "…"}»`}
-                data-tip="В очередь"
-                onclick={() => queueTrack(track)}
-              >
-                {@html icon("plus")}
-              </button>
-            </li>
-          {/each}
-        </ul>
+        {#if filteredLiked.length}
+          <ul class={[qStyles.list, styles.scrollList]}>
+            {#each filteredLiked as { track, index } (track.ID)}
+              <li class={qStyles.row}>
+                <button
+                  class={qStyles.track}
+                  type="button"
+                  aria-label={`Включить «${track.Title || "…"}»`}
+                  disabled={busy || !track.ID}
+                  onclick={() => playAction({ action: "liked", index })}
+                >
+                  <img class={qStyles.image} src={thumbnail(track)} alt="" loading="lazy" />
+                  <span class={qStyles.description}>
+                    <b>{track.Title || track.ID}</b>
+                    <span>{track.Author || ""}</span>
+                  </span>
+                </button>
+                <button
+                  class={["ib", qStyles.remove, qStyles.keepVisible, "liked"]}
+                  type="button"
+                  disabled={busy || !track.ID}
+                  aria-pressed="true"
+                  aria-label={`Убрать лайк «${track.Title || "…"}»`}
+                  data-tip="Убрать лайк"
+                  onclick={(event) => toggleLike(track, false, event)}
+                >
+                  {@html icon("heart")}
+                </button>
+                <button
+                  class={["ib", qStyles.remove]}
+                  type="button"
+                  disabled={busy || !track.ID}
+                  aria-label={`Добавить в очередь «${track.Title || "…"}»`}
+                  data-tip="В очередь"
+                  onclick={() => queueTrack(track)}
+                >
+                  {@html icon("plus")}
+                </button>
+              </li>
+            {/each}
+          </ul>
+        {:else}
+          <p class="empty">По фильтру «{filterText}» в лайках ничего не найдено</p>
+        {/if}
       {:else}
         <p class="empty">Понравившиеся видео пока не найдены в аккаунте YouTube</p>
       {/if}
@@ -277,9 +389,10 @@
         <p class="empty">Загружаю треки плейлиста…</p>
       {:else if playlistError}
         <p class={styles.errorNote}>{playlistError}</p>
-      {:else if playlistTracks.length}
+      {:else if filteredPlaylistTracks.length}
         <ul class={[qStyles.list, styles.scrollList]}>
-          {#each playlistTracks as track, index}
+          {#each filteredPlaylistTracks as { track, index } (track.ID + ":" + index)}
+            {@const trackLiked = likedSet.has(track.ID)}
             <li class={qStyles.row}>
               <button
                 class={qStyles.track}
@@ -295,9 +408,20 @@
               >
                 <img class={qStyles.image} src={thumbnail(track)} alt="" loading="lazy" />
                 <span class={qStyles.description}>
-                  <b>{track.Title || "…"}</b>
+                  <b>{track.Title || track.ID}</b>
                   <span>{track.Author || ""}</span>
                 </span>
+              </button>
+              <button
+                class={["ib", qStyles.remove, { [qStyles.keepVisible]: trackLiked, liked: trackLiked }]}
+                type="button"
+                disabled={busy || !track.ID}
+                aria-pressed={trackLiked}
+                aria-label={trackLiked ? `Убрать лайк «${track.Title || "…"}»` : `Поставить лайк «${track.Title || "…"}»`}
+                data-tip={trackLiked ? "Убрать лайк" : "Поставить лайк"}
+                onclick={(event) => toggleLike(track, !trackLiked, event)}
+              >
+                {@html icon("heart")}
               </button>
               <button
                 class={["ib", qStyles.remove]}
@@ -312,14 +436,16 @@
             </li>
           {/each}
         </ul>
+      {:else if playlistTracks.length}
+        <p class="empty">По фильтру «{filterText}» в плейлисте ничего не найдено</p>
       {:else}
         <p class="empty">В этом плейлисте нет доступных видео</p>
       {/if}
     {:else if loading && !library}
       <p class="empty">Загружаю плейлисты…</p>
-    {:else if playlists.length}
+    {:else if filteredPlaylists.length}
       <ul class={[qStyles.list, styles.scrollList]}>
-        {#each playlists as pl}
+        {#each filteredPlaylists as pl (pl.ID)}
           <li class={qStyles.row}>
             <button
               class={qStyles.track}
@@ -352,6 +478,8 @@
           </li>
         {/each}
       </ul>
+    {:else if playlists.length}
+      <p class="empty">По фильтру «{filterText}» плейлисты не найдены</p>
     {:else}
       <p class="empty">Сохранённых плейлистов в аккаунте YouTube пока нет</p>
     {/if}

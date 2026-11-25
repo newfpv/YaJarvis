@@ -27,6 +27,53 @@
   margin-bottom: 12px;
 }
 
+.filterRow {
+  margin-bottom: 10px;
+}
+
+.filterField {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--line2);
+  border-radius: 10px;
+  background: rgb(0 0 0 / .22);
+  color: var(--fg3);
+}
+
+.filterField:focus-within {
+  border-color: var(--acc);
+  color: var(--fg2);
+}
+
+.filterField :global(.ic) {
+  width: 14px;
+  height: 14px;
+  flex: none;
+}
+
+.filterField input,
+.filterField input:focus {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  box-shadow: none;
+  color: var(--fg);
+  font-size: 13px;
+}
+
+.filterClear {
+  width: 24px;
+  height: 24px;
+  border: 0;
+}
+
 .actionBtn {
   display: inline-flex;
   align-items: center;

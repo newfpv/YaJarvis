@@ -176,6 +176,8 @@ pub fn router(app: App) -> Router {
         .route("/api/youtube/login", post(music::youtube_login).delete(music::youtube_logout))
         .route("/api/youtube/library", get(music::youtube_library))
         .route("/api/youtube/playlist/{id}", get(music::youtube_playlist))
+        .route("/api/youtube/like", post(music::youtube_like))
+        .route("/api/youtube/search", get(music::youtube_search))
         .route("/api/vless", put(vpn::put))
         .route("/api/test/net", post(vpn::test_net))
         .route("/api/memory", get(memory::get).put(memory::put))

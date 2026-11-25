@@ -1,7 +1,8 @@
 <script>
   import { onMount } from "svelte";
   import { icon } from "#helpers/core.js";
-  import { artOf, clockStr, mountPlayback, musicAct, musicData, playMusicQuery, setArt } from "#state/player.js";
+  import { speaker } from "#state/panelState.js";
+  import { artOf, clockStr, mountPlayback, musicAct, musicData, playMusicQuery, setArt, setYoutubeLike, subscribeLikes } from "#state/player.js";
 
   let state = $state.raw(null);
   let cover = $state();
@@ -10,6 +11,7 @@
   let seek = $state();
   let query = $state("");
   let pending = $state("");
+  let likedSet = $state.raw(new Set());
 
   let track = $derived(state?.track || {});
   let active = $derived(!!(state?.playing || state?.paused));
@@ -22,11 +24,17 @@
   let image = $derived(active ? artOf(track, true, state) : "");
   let fallback = $derived(active ? artOf(track, false, state) : "");
   let duration = $derived(state?.dur ? clockStr(state.dur) : "");
+  let youtubeSigned = $derived(Boolean($speaker?.youtube?.plugin && ($speaker?.youtube?.account?.signed_in || $speaker?.youtube?.set)));
+  let isLiked = $derived(Boolean(!yandex && active && track?.ID && (likedSet.has(track.ID) || state?.liked)));
 
   onMount(() => {
     const release = mountPlayback(seek, time, bars, (snapshot) => { state = snapshot; });
+    const releaseLikes = subscribeLikes((ids) => { likedSet = new Set(ids); });
     void musicData();
-    return release;
+    return () => {
+      release();
+      releaseLikes();
+    };
   });
 
   $effect(() => {
@@ -38,6 +46,16 @@
     pending = action;
     try {
       await musicAct(action, event.currentTarget, { disableControl: false });
+    } finally {
+      pending = "";
+    }
+  }
+
+  async function toggleLike(event) {
+    if (pending || !track?.ID || !youtubeSigned) return;
+    pending = "like";
+    try {
+      await setYoutubeLike(track.ID, !isLiked, track, event.currentTarget);
     } finally {
       pending = "";
     }
@@ -84,6 +102,13 @@
     <button class="cbtn" type="button" data-m="next" id="np-next" aria-label="Следующий"
       disabled={pending === "next" || (!yandex && !state?.next?.length)}
       onclick={(event) => control(event, "next")}>{@html icon("skip", "solid")}</button>
+    {#if !yandex && active && track?.ID}
+      <button class="cbtn" class:liked={isLiked} type="button" data-m="like" id="np-like"
+        aria-label={isLiked ? "Убрать лайк" : "Поставить лайк"} aria-pressed={isLiked}
+        disabled={pending === "like" || !youtubeSigned}
+        data-tip={!youtubeSigned ? "Войдите в YouTube в настройках" : isLiked ? "Убрать лайк" : "Поставить лайк"}
+        onclick={toggleLike}>{@html icon("heart")}</button>
+    {/if}
     <button class="cbtn" type="button" data-m="copy" aria-label="Скопировать ссылку" disabled={pending === "copy"}
       onclick={(event) => control(event, "copy")}>{@html icon("link")}</button>
   </div>

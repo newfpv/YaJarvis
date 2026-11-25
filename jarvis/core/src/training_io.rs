@@ -88,6 +88,7 @@ pub struct AudioBatch {
     hit: bool,
     discard: bool,
     prob: f32,
+    peak_tail: usize,
 }
 
 impl AudioBatch {
@@ -96,6 +97,7 @@ impl AudioBatch {
         self.hit = false;
         self.discard = false;
         self.prob = 0.0;
+        self.peak_tail = 0;
     }
 
     pub fn push(
@@ -107,9 +109,17 @@ impl AudioBatch {
         collect: bool,
         limit: i64,
     ) -> Option<Value> {
+        if hit {
+            self.prob = self.prob.max(prob);
+            self.peak_tail = 0;
+        } else if !self.hit && prob > self.prob {
+            self.prob = prob;
+            self.peak_tail = 0;
+        } else {
+            self.peak_tail = self.peak_tail.saturating_add(pcm.len());
+        }
         self.hit |= hit;
         self.discard |= discard;
-        self.prob = self.prob.max(prob);
         self.pcm.extend_from_slice(pcm);
         if self.pcm.len() < 3_200 && !hit {
             return None;
@@ -120,7 +130,7 @@ impl AudioBatch {
                 .flat_map(|sample| sample.to_le_bytes())
                 .collect::<Vec<_>>(),
         );
-        let value = json!({"pcm":pcm,"hit":self.hit,"discard":self.discard,"prob":self.prob,"collect":collect,"limit":limit});
+        let value = json!({"pcm":pcm,"hit":self.hit,"discard":self.discard,"prob":self.prob,"trigger_tail":self.peak_tail,"collect":collect,"limit":limit});
         self.reset();
         Some(value)
     }

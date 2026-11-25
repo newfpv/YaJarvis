@@ -1,12 +1,14 @@
 <script>
   import { onMount } from "svelte";
   import { icon, toast } from "#helpers/core.js";
-  import { music, playMusicQuery, subscribeMusic } from "#state/player.js";
+  import { speaker } from "#state/panelState.js";
+  import { music, playMusicQuery, setYoutubeLike, subscribeLikes, subscribeMusic } from "#state/player.js";
   import styles from "./PlayerQueue.module.css";
 
   let state = $state.raw(null);
   let query = $state("");
   let busy = $state(false);
+  let likedSet = $state.raw(new Set());
   let disposed = false;
   let playing = $derived(!!(state?.playing || state?.paused));
   let yandex = $derived(state?.source === "yandex");
@@ -14,12 +16,15 @@
   let queued = $derived(state?.queue || 0);
   let next = $derived(yandex ? [] : state?.next || []);
   let history = $derived((state?.history || []).filter((track) => !(playing && !yandex && track.ID === current.ID)).slice(0, 12));
+  let youtubeSigned = $derived(Boolean($speaker?.youtube?.plugin && ($speaker?.youtube?.account?.signed_in || $speaker?.youtube?.set)));
 
   onMount(() => {
     const unsubscribe = subscribeMusic((snapshot) => state = snapshot);
+    const unsubLikes = subscribeLikes((ids) => { likedSet = new Set(ids); });
     return () => {
       disposed = true;
       unsubscribe();
+      unsubLikes();
     };
   });
 
@@ -50,12 +55,22 @@
     if (!track.ID) return;
     void run(async () => {
       if (index != null && !(await music({ action: "unqueue", index }))) return;
-      await music({ action: "id", query: track.ID });
+      await music({ action: "id", query: track.ID, title: track.Title || "", author: track.Author || "" });
     });
   }
 
   function remove(index) {
     void run(() => music({ action: "unqueue", index }));
+  }
+
+  function toggleLike(track, event) {
+    if (!track?.ID || busy || !youtubeSigned) return;
+    const liked = !likedSet.has(track.ID);
+    void run(() => setYoutubeLike(track.ID, liked, track, event?.currentTarget));
+  }
+
+  function isYoutubeTrack(track) {
+    return Boolean(track?.ID && !/^\d+$/.test(track.ID));
   }
 
   function thumbnail(track) {
@@ -78,11 +93,21 @@
 {/snippet}
 
 {#snippet row(track, badge = "", index = null)}
+  {@const liked = isYoutubeTrack(track) && likedSet.has(track.ID)}
   <li class={styles.row}>
     <button class={styles.track} type="button" aria-label={`Включить «${track.Title || "…"}»`}
       disabled={busy || !track.ID} onclick={() => play(track, index)}>
       {@render trackInfo(track, thumbnail(track), badge)}
     </button>
+    {#if youtubeSigned && isYoutubeTrack(track)}
+      <button class={["ib", styles.remove, { [styles.keepVisible]: liked, liked }]} type="button" disabled={busy}
+        aria-label={liked ? `Убрать лайк «${track.Title || "…"}»` : `Поставить лайк «${track.Title || "…"}»`}
+        aria-pressed={liked}
+        data-tip={liked ? "Убрать лайк" : "Поставить лайк"}
+        onclick={(event) => toggleLike(track, event)}>
+        {@html icon("heart")}
+      </button>
+    {/if}
     {#if index != null}
       <button class={["ib", styles.remove]} type="button" disabled={busy}
         aria-label={`Убрать из очереди «${track.Title || "…"}»`} data-tip="Убрать" onclick={() => remove(index)}>
@@ -115,6 +140,15 @@
       {#if playing}
         <li class={[styles.row, styles.current]} aria-current="true">
           <div class={styles.track}>{@render trackInfo(current, (yandex && state.cover) || thumbnail(current), "", true)}</div>
+          {#if youtubeSigned && !yandex && isYoutubeTrack(current)}
+            {@const curLiked = likedSet.has(current.ID)}
+            <button class={["ib", styles.remove, { [styles.keepVisible]: curLiked, liked: curLiked }]} type="button"
+              disabled={busy} aria-label={curLiked ? "Убрать лайк" : "Поставить лайк"} aria-pressed={curLiked}
+              data-tip={curLiked ? "Убрать лайк" : "Поставить лайк"}
+              onclick={(event) => toggleLike(current, event)}>
+              {@html icon("heart")}
+            </button>
+          {/if}
         </li>
       {/if}
       {#each next as track, index}

@@ -6,12 +6,15 @@ mod remote;
 use account::{Account, COOKIES};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use jarvis_home_common::{Host, load, normal, random, save, text};
-use remote::{Playlist, Remote, Stream, Track, playlist_id_from_url, valid_id, valid_playlist_id, video_id};
+use remote::{
+    Playlist, Remote, SearchFilter, SearchItem, Stream, Track, playlist_id_from_url, valid_id,
+    valid_playlist_id, video_id,
+};
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, Ordering},
@@ -70,6 +73,8 @@ struct State {
     queue: VecDeque<Track>,
     related: VecDeque<Track>,
     history: BTreeMap<String, Saved>,
+    liked_ids: HashSet<String>,
+    liked_loaded: bool,
     saved: Option<Instant>,
     proposal: Option<(Instant, VecDeque<Track>)>,
     personal: bool,
@@ -116,12 +121,14 @@ impl State {
         let mut history: Vec<_> = self.history.values().collect();
         history.sort_by_key(|entry| std::cmp::Reverse(&entry.updated));
         let history: Vec<_> = history.iter().take(30).map(|entry| &entry.track).collect();
+        let liked = active && self.liked_ids.contains(&self.track.id);
+        let liked_ids: Vec<_> = self.liked_ids.iter().cloned().collect();
         json!({
             "source":"youtube", "playing":self.playing(), "paused":self.phase==Phase::Paused,
             "loading":matches!(self.phase, Phase::Loading | Phase::Buffering), "track":if active{self.track.clone()}else{Track::default()},
             "pos":if active{self.pos}else{0.0}, "dur":if active{self.dur()}else{0.0},
             "client":self.stream.as_ref().map_or("",|v|v.client), "next":next, "queue":self.queue.len(),
-            "radio":radio, "repeat":self.repeat, "history":history, "error":self.error
+            "radio":radio, "repeat":self.repeat, "liked":liked, "liked_ids":liked_ids, "history":history, "error":self.error
         })
     }
 }
@@ -282,8 +289,17 @@ impl Youtube {
         {
             return None;
         }
+        let mut track = state.track.clone();
+        if let Some(prev) = previous {
+            if needs_title(&track) && !needs_title(&prev.track) {
+                track.title = prev.track.title.clone();
+            }
+            if track.author.is_empty() && !prev.track.author.is_empty() {
+                track.author = prev.track.author.clone();
+            }
+        }
         let entry = Saved {
-            track: state.track.clone(),
+            track,
             pos: state.pos,
             dur: state.dur(),
             updated: jiff::Timestamp::now().to_string(),
@@ -428,6 +444,50 @@ impl Youtube {
         self.remote.search(query, HeaderMap::new()).await
     }
 
+    async fn lookup_known_track(&self, id: &str) -> Option<Track> {
+        let mut out = Track::from_id(id.to_string());
+        let merge = |dst: &mut Track, src: &Track| {
+            if needs_title(dst) && !needs_title(src) {
+                dst.title = src.title.clone();
+            }
+            if dst.author.is_empty() && !src.author.is_empty() {
+                dst.author = src.author.clone();
+            }
+        };
+        {
+            let state = self.state.lock().unwrap();
+            if state.track.id == id {
+                merge(&mut out, &state.track);
+            }
+            for t in state.queue.iter().chain(state.related.iter()) {
+                if t.id == id {
+                    merge(&mut out, t);
+                }
+            }
+            if let Some(saved) = state.history.get(id) {
+                merge(&mut out, &saved.track);
+            }
+        }
+        if needs_title(&out) || out.author.is_empty() {
+            let cache = self.library_cache.lock().await;
+            if let Some((_, liked)) = &cache.liked {
+                for t in liked {
+                    if t.id == id {
+                        merge(&mut out, t);
+                    }
+                }
+            }
+            for (_, (_, list)) in &cache.items {
+                for t in list {
+                    if t.id == id {
+                        merge(&mut out, t);
+                    }
+                }
+            }
+        }
+        (!needs_title(&out) || !out.author.is_empty()).then_some(out)
+    }
+
     async fn resolve(&self, track: Track, prefer_tv: bool) -> Result<(Track, Stream), String> {
         let anonymous = self.remote.resolve(&track.id, HeaderMap::new(), prefer_tv).await;
         let (mut info, stream) = match anonymous {
@@ -440,13 +500,33 @@ impl Youtube {
                 self.remote.resolve(&track.id, auth, true).await?
             }
         };
-        if info.title.is_empty() {
+        if needs_title(&info) && !needs_title(&track) {
             info.title = track.title;
         }
-        if info.author.is_empty() {
+        if info.author.is_empty() && !track.author.is_empty() {
             info.author = track.author;
         }
-        if info.title.is_empty() {
+        if needs_title(&info) || info.author.is_empty() {
+            if let Some(known) = self.lookup_known_track(&info.id).await {
+                if needs_title(&info) && !needs_title(&known) {
+                    info.title = known.title;
+                }
+                if info.author.is_empty() && !known.author.is_empty() {
+                    info.author = known.author;
+                }
+            }
+        }
+        if (needs_title(&info) || info.author.is_empty())
+            && let Ok(meta) = self.remote.oembed(&info.id).await
+        {
+            if needs_title(&info) && !needs_title(&meta) {
+                info.title = meta.title;
+            }
+            if info.author.is_empty() && !meta.author.is_empty() {
+                info.author = meta.author;
+            }
+        }
+        if info.title.trim().is_empty() {
             info.title = info.id.clone();
         }
         Ok((info, stream))
@@ -603,6 +683,12 @@ impl Youtube {
                     }
                     if first {
                         self.wake.notify_one();
+                        if !self.state.lock().unwrap().liked_loaded {
+                            let service = self.clone();
+                            tokio::spawn(async move {
+                                service.ensure_liked_loaded().await;
+                            });
+                        }
                         if needs_related {
                             let service = self.clone();
                             let seed = track.id.clone();
@@ -799,8 +885,26 @@ impl Youtube {
                 let id = video_id(&id)
                     .or_else(|| valid_id(&id).then_some(id))
                     .ok_or("Неверный ID видео YouTube")?;
+                let mut track = Track {
+                    id: id.clone(),
+                    title: text(&args["title"]).trim().to_string(),
+                    author: text(&args["author"]).trim().to_string(),
+                };
+                if track.title == track.id {
+                    track.title.clear();
+                }
+                if (needs_title(&track) || track.author.is_empty())
+                    && let Some(known) = self.lookup_known_track(&id).await
+                {
+                    if needs_title(&track) && !needs_title(&known) {
+                        track.title = known.title;
+                    }
+                    if track.author.is_empty() && !known.author.is_empty() {
+                        track.author = known.author;
+                    }
+                }
                 self.state.lock().unwrap().personal = false;
-                (vec![Track::from_id(id)], 0.0)
+                (vec![track], 0.0)
             }
             "next" => {
                 let radio = self.radio().await;
@@ -1076,17 +1180,43 @@ impl Youtube {
             "play_playlist" => self.play_playlist_op(args).await,
             "enqueue" => {
                 let _lock = self.request.lock().await;
-                let track = self
+                let mut track = self
                     .search(&text(&args["query"]), false)
                     .await?
                     .into_iter()
                     .next()
                     .ok_or("YouTube ничего не нашёл")?;
-                let track = if track.title.is_empty() {
-                    self.resolve(track, false).await?.0
-                } else {
-                    track
-                };
+                let hint_title = text(&args["title"]).trim().to_string();
+                let hint_author = text(&args["author"]).trim().to_string();
+                if needs_title(&track) && !hint_title.is_empty() && hint_title != track.id {
+                    track.title = hint_title;
+                }
+                if track.author.is_empty() && !hint_author.is_empty() {
+                    track.author = hint_author;
+                }
+                if (needs_title(&track) || track.author.is_empty())
+                    && let Some(known) = self.lookup_known_track(&track.id).await
+                {
+                    if needs_title(&track) && !needs_title(&known) {
+                        track.title = known.title;
+                    }
+                    if track.author.is_empty() && !known.author.is_empty() {
+                        track.author = known.author;
+                    }
+                }
+                if (needs_title(&track) || track.author.is_empty())
+                    && let Ok(meta) = self.remote.oembed(&track.id).await
+                {
+                    if needs_title(&track) && !needs_title(&meta) {
+                        track.title = meta.title;
+                    }
+                    if track.author.is_empty() && !meta.author.is_empty() {
+                        track.author = meta.author;
+                    }
+                }
+                if track.title.is_empty() {
+                    track.title = track.id.clone();
+                }
                 let mut state = self.state.lock().unwrap();
                 if state.queue.len() >= 100 {
                     return Err("Очередь заполнена".into());
@@ -1094,6 +1224,8 @@ impl Youtube {
                 state.queue.push_back(track.clone());
                 Ok(json!(track))
             }
+            "like" => self.like_op(args).await,
+            "search" => self.search_op(args).await,
             "unqueue" => {
                 if let Some(index) = args["index"].as_u64().and_then(|v| usize::try_from(v).ok()) {
                     self.state.lock().unwrap().queue.remove(index);
@@ -1126,12 +1258,20 @@ impl Youtube {
                     .await?;
                 self.account.clear_profile_cache().await;
                 self.library_cache.lock().await.clear();
+                let mut state = self.state.lock().unwrap();
+                state.liked_ids.clear();
+                state.liked_loaded = false;
+                self.wake.notify_one();
                 Ok(Value::Null)
             }
             "cookies_clear" => {
                 self.account.clear_cookies()?;
                 self.account.clear_profile_cache().await;
                 self.library_cache.lock().await.clear();
+                let mut state = self.state.lock().unwrap();
+                state.liked_ids.clear();
+                state.liked_loaded = false;
+                self.wake.notify_one();
                 Ok(Value::Null)
             }
             "account" => {
@@ -1142,6 +1282,10 @@ impl Youtube {
                 self.account.logout().await?;
                 let _ = self.account.clear_cookies();
                 self.library_cache.lock().await.clear();
+                let mut state = self.state.lock().unwrap();
+                state.liked_ids.clear();
+                state.liked_loaded = false;
+                self.wake.notify_one();
                 Ok(Value::Null)
             }
             _ => Err("Неизвестная команда плеера".into()),
@@ -1206,6 +1350,12 @@ impl Youtube {
         let mut error = String::new();
         let liked = match liked_res {
             Ok(v) => {
+                {
+                    let mut st = self.state.lock().unwrap();
+                    st.liked_ids = v.iter().map(|t| t.id.clone()).collect();
+                    st.liked_loaded = true;
+                    self.wake.notify_one();
+                }
                 let mut cache = self.library_cache.lock().await;
                 cache.liked = Some((Instant::now(), v.clone()));
                 v
@@ -1284,6 +1434,12 @@ impl Youtube {
             Some(v) => v,
             None => {
                 let fresh = self.remote.liked_tracks(headers, 100).await?;
+                {
+                    let mut st = self.state.lock().unwrap();
+                    st.liked_ids = fresh.iter().map(|t| t.id.clone()).collect();
+                    st.liked_loaded = true;
+                    self.wake.notify_one();
+                }
                 self.library_cache.lock().await.liked = Some((Instant::now(), fresh.clone()));
                 fresh
             }
@@ -1451,6 +1607,212 @@ impl Youtube {
         let started = finished.await.map_err(|_| "Воспроизведение отменено")??;
         Ok((started, total))
     }
+
+    async fn ensure_liked_loaded(&self) {
+        if self.state.lock().unwrap().liked_loaded {
+            return;
+        }
+        let Ok(headers) = self.auth_headers().await else {
+            return;
+        };
+        if headers.is_empty() {
+            return;
+        }
+        let cached = {
+            let cache = self.library_cache.lock().await;
+            cache
+                .liked
+                .as_ref()
+                .filter(|(at, _)| at.elapsed() < LIBRARY_CACHE_TTL)
+                .map(|(_, v)| v.clone())
+        };
+        let tracks = match cached {
+            Some(v) => Ok(v),
+            None => self.remote.liked_tracks(headers, 100).await,
+        };
+        if let Ok(tracks) = tracks {
+            {
+                let mut st = self.state.lock().unwrap();
+                st.liked_ids = tracks.iter().map(|t| t.id.clone()).collect();
+                st.liked_loaded = true;
+                self.wake.notify_one();
+            }
+            self.library_cache.lock().await.liked = Some((Instant::now(), tracks));
+        }
+    }
+
+    async fn like_op(&self, args: &Value) -> Result<Value, String> {
+        let raw_id = text(&args["id"]).trim().to_string();
+        let id = if !raw_id.is_empty() {
+            video_id(&raw_id)
+                .or_else(|| valid_id(&raw_id).then_some(raw_id))
+                .ok_or("Неверный ID видео YouTube")?
+        } else {
+            let st = self.state.lock().unwrap();
+            if st.phase != Phase::Idle && valid_id(&st.track.id) {
+                st.track.id.clone()
+            } else {
+                return Err("Сейчас ничего не играет".into());
+            }
+        };
+        let headers = self.auth_headers().await?;
+        if headers.is_empty() {
+            return Err("Войдите в аккаунт YouTube в настройках".into());
+        }
+        if args["liked"].as_bool().is_none() && !self.state.lock().unwrap().liked_loaded {
+            self.ensure_liked_loaded().await;
+        }
+        let liked = args["liked"].as_bool().unwrap_or_else(|| {
+            !self.state.lock().unwrap().liked_ids.contains(&id)
+        });
+        self.remote.set_like(&id, liked, headers).await?;
+
+        let mut track = Track {
+            id: id.clone(),
+            title: text(&args["title"]).trim().to_string(),
+            author: text(&args["author"]).trim().to_string(),
+        };
+        if track.title == track.id {
+            track.title.clear();
+        }
+        if (needs_title(&track) || track.author.is_empty())
+            && let Some(known) = self.lookup_known_track(&id).await
+        {
+            if needs_title(&track) && !needs_title(&known) {
+                track.title = known.title;
+            }
+            if track.author.is_empty() && !known.author.is_empty() {
+                track.author = known.author;
+            }
+        }
+        if (needs_title(&track) || track.author.is_empty())
+            && let Ok(meta) = self.remote.oembed(&id).await
+        {
+            if needs_title(&track) && !needs_title(&meta) {
+                track.title = meta.title;
+            }
+            if track.author.is_empty() && !meta.author.is_empty() {
+                track.author = meta.author;
+            }
+        }
+        if track.title.is_empty() {
+            track.title = id.clone();
+        }
+
+        {
+            let mut st = self.state.lock().unwrap();
+            if liked {
+                st.liked_ids.insert(id.clone());
+            } else {
+                st.liked_ids.remove(&id);
+            }
+            st.liked_loaded = true;
+            self.wake.notify_one();
+        }
+        {
+            let mut cache = self.library_cache.lock().await;
+            if let Some((at, list)) = cache.liked.as_mut() {
+                list.retain(|t| t.id != id);
+                if liked {
+                    list.insert(0, track.clone());
+                }
+                *at = Instant::now();
+            }
+        }
+        Ok(json!({"id": id, "liked": liked, "track": track}))
+    }
+
+    async fn search_op(&self, args: &Value) -> Result<Value, String> {
+        let query = text(&args["query"]).trim().to_string();
+        if query.is_empty() {
+            return Err("Введите запрос для поиска".into());
+        }
+        if query.len() > 2048 {
+            return Err("Слишком длинный запрос".into());
+        }
+        let kind = match text(&args["type"]).trim() {
+            "playlist" => "playlist",
+            "all" => "all",
+            _ => "video",
+        };
+        if let Some(id) = video_id(&query).or_else(|| valid_id(&query).then(|| query.clone())) {
+            let mut track = self
+                .lookup_known_track(&id)
+                .await
+                .unwrap_or_else(|| Track::from_id(id.clone()));
+            if (needs_title(&track) || track.author.is_empty())
+                && let Ok(meta) = self.remote.oembed(&id).await
+            {
+                if needs_title(&track) && !needs_title(&meta) {
+                    track.title = meta.title;
+                }
+                if track.author.is_empty() && !meta.author.is_empty() {
+                    track.author = meta.author;
+                }
+            }
+            if track.title.is_empty() {
+                track.title = id.clone();
+            }
+            return Ok(json!({
+                "query": query,
+                "items": [SearchItem {
+                    kind: "video".into(),
+                    id: id.clone(),
+                    title: track.title,
+                    author: track.author,
+                    thumb: format!("https://i.ytimg.com/vi/{id}/mqdefault.jpg"),
+                    ..Default::default()
+                }]
+            }));
+        }
+        if let Some(pid) = playlist_id_from_url(&query) {
+            let title = self
+                .library_cache
+                .lock()
+                .await
+                .playlists
+                .as_ref()
+                .and_then(|(_, list)| list.iter().find(|p| p.id == pid).map(|p| p.title.clone()))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "Плейлист YouTube".into());
+            return Ok(json!({
+                "query": query,
+                "items": [SearchItem {
+                    kind: "playlist".into(),
+                    id: pid,
+                    title,
+                    ..Default::default()
+                }]
+            }));
+        }
+        let filter = SearchFilter {
+            kind: kind.to_string(),
+            sort: text(&args["sort"]).trim().to_string(),
+            date: text(&args["date"]).trim().to_string(),
+            duration: text(&args["duration"]).trim().to_string(),
+            live: args["live"] == true,
+        };
+        let personal = self.account.web_headers();
+        let items = if !personal.is_empty() {
+            match self.remote.search_filtered(&query, &filter, personal).await {
+                Ok(found) if !found.is_empty() => found,
+                _ => self
+                    .remote
+                    .search_filtered(&query, &filter, HeaderMap::new())
+                    .await?,
+            }
+        } else {
+            self.remote
+                .search_filtered(&query, &filter, HeaderMap::new())
+                .await?
+        };
+        Ok(json!({"query": query, "items": items}))
+    }
+}
+
+fn needs_title(track: &Track) -> bool {
+    let t = track.title.trim();
+    t.is_empty() || t == track.id
 }
 
 fn shuffle_tracks(tracks: &mut [Track]) {
@@ -1799,5 +2161,68 @@ mod tests {
             .await
             .unwrap_err();
         assert!(bad_pl.contains("Неверный ID"), "{bad_pl}");
+    }
+
+    #[tokio::test]
+    async fn preserves_known_titles_in_play_id_and_tracks_liked_ids_in_snapshot() {
+        let dir = std::env::temp_dir().join("jarvis-yt-like-meta-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let host = Host::new(
+            Arc::new(|method, _| {
+                Box::pin(async move {
+                    if method == "config.get" {
+                        Ok(json!({"auth": {"refresh": "", "name": ""}}))
+                    } else {
+                        Ok(json!({}))
+                    }
+                })
+            }),
+            dir,
+        );
+        let yt = Arc::new(Youtube::new(host));
+        {
+            let mut cache = yt.library_cache.lock().await;
+            cache.liked = Some((
+                Instant::now(),
+                vec![Track {
+                    id: "s0lMgCAmlgY".into(),
+                    title: "ЗОМБИ".into(),
+                    author: "Джарахов".into(),
+                }],
+            ));
+            let mut st = yt.state.lock().unwrap();
+            st.liked_ids.insert("s0lMgCAmlgY".into());
+            st.liked_loaded = true;
+            st.phase = Phase::Playing;
+            st.track = Track {
+                id: "s0lMgCAmlgY".into(),
+                title: "ЗОМБИ".into(),
+                author: "Джарахов".into(),
+            };
+        }
+        let known = yt.lookup_known_track("s0lMgCAmlgY").await.unwrap();
+        assert_eq!(known.title, "ЗОМБИ");
+        assert_eq!(known.author, "Джарахов");
+
+        let snap = yt.state.lock().unwrap().snapshot(true);
+        assert_eq!(snap["liked"], true);
+        assert_eq!(snap["liked_ids"], json!(["s0lMgCAmlgY"]));
+
+        // When recording progress with missing title while history has real title, real title survives.
+        {
+            let mut st = yt.state.lock().unwrap();
+            st.pos = 12.0;
+            yt.record_progress(&mut st, false);
+            st.track = Track {
+                id: "s0lMgCAmlgY".into(),
+                title: "s0lMgCAmlgY".into(),
+                author: String::new(),
+            };
+            st.pos = 25.0;
+            yt.record_progress(&mut st, false);
+            let saved = &st.history["s0lMgCAmlgY"];
+            assert_eq!(saved.track.title, "ЗОМБИ");
+            assert_eq!(saved.track.author, "Джарахов");
+        }
     }
 }

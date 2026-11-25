@@ -994,6 +994,14 @@ impl YandexDisk {
             .is_some_and(|c| c.clips.iter().any(|clip| clip.kind == kind && clip.name == name))
     }
 
+    pub fn cached_clips(&self) -> Vec<RemoteClip> {
+        let s = self.state.lock().unwrap();
+        s.list_cache
+            .as_ref()
+            .map(|c| c.clips.clone())
+            .unwrap_or_default()
+    }
+
     pub async fn download_clip(&self, kind: &str, name: &str) -> Result<Vec<u8>, String> {
         if !KINDS.contains(&kind) || !valid_name(name) {
             return Err("Неверное имя записи".into());

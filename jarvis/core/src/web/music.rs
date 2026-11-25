@@ -18,8 +18,23 @@ pub async fn post(State(app): State<App>, Json(v): Json<Value>) -> Response {
     let (op, args) = match action {
         "play" | "queue" if query.is_empty() => return bad("Что включить?"),
         "play" => ("play", json!({"query":query})),
-        "id" if !query.is_empty() => ("play_id", json!({"id":query})),
-        "queue" => ("enqueue", json!({"query":query})),
+        "id" if !query.is_empty() => (
+            "play_id",
+            json!({"id":query,"title":v["title"],"author":v["author"]}),
+        ),
+        "queue" => (
+            "enqueue",
+            json!({"query":query,"title":v["title"],"author":v["author"]}),
+        ),
+        "like" | "unlike" => (
+            "like",
+            json!({
+                "id": v["id"],
+                "liked": action == "like",
+                "title": v["title"],
+                "author": v["author"]
+            }),
+        ),
         "liked" => (
             "play_liked",
             json!({
@@ -155,6 +170,40 @@ pub async fn youtube_playlist(
         )
         .await
     {
+        Ok(value) => reply(StatusCode::OK, value),
+        Err(error) => bad(error),
+    }
+}
+
+pub async fn youtube_like(State(app): State<App>, Json(v): Json<Value>) -> Response {
+    match app.engine.music.call(&app.plugins, "like", v).await {
+        Ok(value) => reply(
+            StatusCode::OK,
+            json!({
+                "ok": true,
+                "id": value["id"],
+                "liked": value["liked"],
+                "track": value["track"],
+                "music": app.engine.music.snapshot(&app.plugins).await,
+            }),
+        ),
+        Err(error) => bad(error),
+    }
+}
+
+pub async fn youtube_search(
+    State(app): State<App>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let args = json!({
+        "query": q.get("q").map(String::as_str).unwrap_or(""),
+        "type": q.get("type").map(String::as_str).unwrap_or("video"),
+        "sort": q.get("sort").map(String::as_str).unwrap_or("relevance"),
+        "date": q.get("date").map(String::as_str).unwrap_or(""),
+        "duration": q.get("duration").map(String::as_str).unwrap_or(""),
+        "live": q.get("live").is_some_and(|v| v == "1" || v == "true"),
+    });
+    match app.engine.music.call(&app.plugins, "search", args).await {
         Ok(value) => reply(StatusCode::OK, value),
         Err(error) => bad(error),
     }

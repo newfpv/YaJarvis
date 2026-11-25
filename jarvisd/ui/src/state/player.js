@@ -5,6 +5,8 @@ import { S } from "./panelState.js";
 let M = null;
 let mAt = 0;
 const musicListeners = new Set();
+let likedIds = new Set();
+const likeListeners = new Set();
 let musicReadPending = false;
 let musicWrites = 0;
 let musicRevision = 0;
@@ -13,6 +15,34 @@ export const clockStr = (s) => { s = Math.max(0, Math.floor(s || 0)); return `${
 const mPlaying = () => !!M?.playing && !M.paused;
 const hash = (n) => { const s = Math.sin(n * 127.1) * 43758.5453; return s - Math.floor(s); };
 const noise = (x) => { const i = Math.floor(x), f = x - i, u = f * f * (3 - 2 * f); return hash(i) * (1 - u) + hash(i + 1) * u; };
+
+function notifyLikes(change = null) {
+  for (const listener of likeListeners) listener(likedIds, change);
+}
+
+export function subscribeLikes(listener) {
+  listener(likedIds, null);
+  likeListeners.add(listener);
+  return () => likeListeners.delete(listener);
+}
+
+export function isTrackLiked(id) {
+  return Boolean(id && likedIds.has(id));
+}
+
+export function syncLikedIds(ids) {
+  if (!Array.isArray(ids)) return;
+  const next = new Set(ids.filter(Boolean));
+  let changed = next.size !== likedIds.size;
+  if (!changed) {
+    for (const id of next) {
+      if (!likedIds.has(id)) { changed = true; break; }
+    }
+  }
+  if (!changed) return;
+  likedIds = next;
+  notifyLikes(null);
+}
 
 function renderMusic() {
   for (const listener of musicListeners) listener(M);
@@ -25,6 +55,22 @@ function acceptMusic(state) {
   bufferingTimer = 0;
   if (state?.playing && state?.loading) {
     bufferingTimer = setTimeout(() => { bufferingTimer = 0; void musicData(); }, 400);
+  }
+  if (Array.isArray(state?.liked_ids)) {
+    const next = new Set(state.liked_ids.filter(Boolean));
+    if (state?.track?.ID && typeof state.liked === "boolean") {
+      if (state.liked) next.add(state.track.ID);
+      else next.delete(state.track.ID);
+    }
+    likedIds = next;
+    notifyLikes(null);
+  } else if (state?.track?.ID && typeof state.liked === "boolean") {
+    const has = likedIds.has(state.track.ID);
+    if (has !== state.liked) {
+      if (state.liked) likedIds.add(state.track.ID);
+      else likedIds.delete(state.track.ID);
+      notifyLikes(null);
+    }
   }
   renderMusic();
 }
@@ -83,7 +129,14 @@ export function musicAct(a, b, { disableControl = true } = {}) {
   }
   if (a === "prev" && M.source !== "yandex") {
     const previous = M.history?.[1];
-    if (previous) return music({ action: "id", query: previous.ID }, control);
+    if (previous) {
+      return music({
+        action: "id",
+        query: previous.ID,
+        title: previous.Title || "",
+        author: previous.Author || "",
+      }, control);
+    }
     return;
   }
   return music({ action: a === "toggle" ? (M.paused ? "resume" : "pause") : a }, control);
@@ -259,6 +312,47 @@ export function youtubeLibrary(refresh = false) {
 
 export function youtubePlaylistItems(id, refresh = false) {
   return api("GET", `/api/youtube/playlist/${encodeURIComponent(id)}${refresh ? "?refresh=1" : ""}`);
+}
+
+export function youtubeSearch({
+  q,
+  type = "video",
+  sort = "relevance",
+  date = "",
+  duration = "",
+  live = false,
+} = {}, { signal } = {}) {
+  const params = new URLSearchParams();
+  params.set("q", String(q || "").trim());
+  if (type) params.set("type", type);
+  if (sort) params.set("sort", sort);
+  if (date) params.set("date", date);
+  if (duration && type !== "playlist") params.set("duration", duration);
+  if (live && type !== "playlist") params.set("live", "1");
+  return api("GET", `/api/youtube/search?${params.toString()}`, undefined, { signal });
+}
+
+export async function setYoutubeLike(id, liked, track = null, btn = null) {
+  let result = null;
+  await act(btn, async () => {
+    const res = await api("POST", "/api/youtube/like", {
+      id: id || "",
+      liked: typeof liked === "boolean" ? liked : undefined,
+      title: track?.Title || "",
+      author: track?.Author || "",
+    });
+    const targetId = res?.id || id;
+    const nextLiked = typeof res?.liked === "boolean" ? res.liked : Boolean(liked);
+    if (targetId) {
+      if (nextLiked) likedIds.add(targetId);
+      else likedIds.delete(targetId);
+    }
+    if (res?.music) acceptMusic(res.music);
+    notifyLikes({ id: targetId, liked: nextLiked, track: res?.track || track });
+    toast(nextLiked ? "Лайк поставлен" : "Лайк убран");
+    result = res;
+  });
+  return result;
 }
 
 export function artOf(track, big, state = M) {

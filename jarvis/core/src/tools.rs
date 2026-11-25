@@ -163,6 +163,9 @@ impl Tools {
         if fastcmd::youtube_request(text) || fastcmd::clarification(text).is_some() {
             return None;
         }
+        if self.direct_home_owns(text).await {
+            return None;
+        }
         if let Some(b) = fastcmd::home_command_local(text) {
             return Some(b);
         }
@@ -172,6 +175,26 @@ impl Tools {
         }
         let m = self.yandex("scenario-match", bare.clone().into(), Duration::from_secs(6)).await.ok()?;
         (m.as_bool() == Some(true)).then_some(bare)
+    }
+
+    async fn direct_home_owns(&self, text: &str) -> bool {
+        if self.ready("xiaomi") && self.use_ch("xiaomi") {
+            if let Ok(Value::Array(devices)) =
+                self.vendor("xiaomi", "devices", Value::Null, Duration::from_millis(600)).await
+                && devices.iter().any(|d| device_matches_command(text, d))
+            {
+                return true;
+            }
+        }
+        if self.use_ch("homeassistant") && self.ha_alive().await {
+            if let Ok(Value::Array(entities)) =
+                self.vendor("homeassistant", "catalog", json!(false), Duration::from_millis(600)).await
+                && entities.iter().any(|d| device_matches_command(text, d))
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// Текст для инструкций бэкенда: время, устройства с возможностями, сценарии с фразами.
@@ -222,9 +245,9 @@ impl Tools {
         }
         if self.music_ctl.is_some() && self.host.provider("youtube").is_ok() {
             defs.push(json!({"type": "function", "name": "music_control",
-                "description": "Управлять тем, что сейчас играет с YouTube: пауза, продолжить, перемотка вперёд/назад, с начала, следующее видео, похожее (радио), повтор (на репит), выключить, что играет.",
+                "description": "Управлять тем, что сейчас играет с YouTube: пауза, продолжить, перемотка вперёд/назад, с начала, следующее видео, похожее (радио), повтор (на репит), поставь лайк, убери лайк, выключить, что играет.",
                 "parameters": {"type": "object", "properties": {
-                    "command": {"type": "string", "description": "команда по-русски, например «пауза», «продолжи», «перемотай вперёд на 2 минуты», «назад на 30 секунд», «сначала», «следующее», «включи похожее», «включи повтор», «выключи повтор», «выключи музыку», «что играет»"}},
+                    "command": {"type": "string", "description": "команда по-русски, например «пауза», «продолжи», «перемотай вперёд на 2 минуты», «назад на 30 секунд», «сначала», «следующее», «включи похожее», «включи повтор», «выключи повтор», «поставь лайк», «убери лайк», «выключи музыку», «что играет»"}},
                     "required": ["command"]}}));
         }
         if self.use_ch("alice") {
@@ -351,12 +374,114 @@ impl Tools {
     }
 }
 
+const CMD_VERB_STOPWORDS: &[&str] = &[
+    "джарвис",
+    "пожалуйста",
+    "конкретно",
+    "включи",
+    "выключи",
+    "погаси",
+    "отключи",
+    "зажги",
+    "запусти",
+    "останови",
+    "сделай",
+    "поставь",
+    "убавь",
+    "прибавь",
+    "увеличь",
+    "уменьши",
+    "открой",
+    "закрой",
+    "отправь",
+    "верни",
+];
+
+fn device_matches_command(text: &str, device: &Value) -> bool {
+    let norm_cmd = fastcmd::norm_text(text);
+    if norm_cmd.is_empty() {
+        return false;
+    }
+    let name_raw = device["name"]
+        .as_str()
+        .or_else(|| device["attributes"]["friendly_name"].as_str())
+        .unwrap_or("");
+    let name = fastcmd::norm_text(name_raw);
+    let kind = device["type"].as_str().unwrap_or("").to_lowercase();
+    let model = device["model"].as_str().unwrap_or("").to_lowercase();
+    let domain = device["domain"]
+        .as_str()
+        .or_else(|| device["entity_id"].as_str().and_then(|id| id.split('.').next()))
+        .unwrap_or("")
+        .to_lowercase();
+    let meta = format!("{} {} {} {}", name, kind, model, domain);
+
+    const PAIRS: &[(&[&str], &[&str])] = &[
+        (&["пылесос", "пылик", "робот"], &["vacuum"]),
+        (&["свет", "ламп", "люстр", "лент", "торшер", "подсвет"], &["light", "lamp", "bulb", "ceiling", "strip"]),
+        (&["розетк", "выключат"], &["outlet", "plug", "switch", "relay"]),
+        (&["кондиц", "кондей", "кондер"], &["air-conditioner", "air_conditioner", "climate"]),
+        (&["увлажнит"], &["humidifier"]),
+        (&["очистит"], &["air-purifier", "purifier"]),
+        (&["чайник"], &["kettle"]),
+        (&["штор", "занавес"], &["curtain", "cover", "blind"]),
+        (&["обогрев"], &["heater"]),
+        (&["вентилятор"], &["fan"]),
+        (&["телевизор"], &["television", "media_player"]),
+    ];
+
+    for (cmd_stems, dev_tokens) in PAIRS {
+        if cmd_stems.iter().any(|stem| norm_cmd.contains(stem))
+            && dev_tokens.iter().any(|tok| meta.contains(tok))
+        {
+            return true;
+        }
+    }
+
+    if !name.is_empty() {
+        let name_words: Vec<&str> = name.split_whitespace().collect();
+        for cw in norm_cmd.split_whitespace() {
+            if cw.chars().count() < 4 || CMD_VERB_STOPWORDS.contains(&cw) {
+                continue;
+            }
+            if name_words.iter().any(|nw| {
+                nw.chars().count() >= 4
+                    && (*nw == cw || nw.starts_with(cw) || cw.starts_with(nw))
+            }) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn defs_load() {
         for n in ["home_assistant", "xiaomi_home", "smart_life", "alice_command", "smart_home", "recall_conversation", "edit_memory"] {
             assert_eq!(super::def(n)["name"], n, "{n}");
         }
+    }
+
+    #[test]
+    fn device_matches_command_routes_xiaomi_and_ha_away_from_alice() {
+        let vacuum = json!({
+            "name": "Mijia Robot Vacuum 5",
+            "room": "",
+            "type": "urn:miot-spec-v2:device:vacuum:0000A006:xiaomi-ov31:1",
+            "model": "xiaomi.vacuum.ov31"
+        });
+        assert!(device_matches_command("включи пылесос в спальне конкретно в спальне", &vacuum));
+        assert!(!device_matches_command("выключи свет на кухне", &vacuum));
+
+        let ha_light = json!({
+            "entity_id": "light.kitchen_ceiling",
+            "attributes": {"friendly_name": "Люстра кухня"}
+        });
+        assert!(device_matches_command("выключи свет на кухне", &ha_light));
+        assert!(!device_matches_command("включи кондиционер", &ha_light));
     }
 }

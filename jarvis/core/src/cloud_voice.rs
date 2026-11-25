@@ -180,7 +180,7 @@ impl Voice {
         };
         let ((context, defs), socket) = if self.id == "elevenlabs" {
             let (context, defs) = prepare.await;
-            let session = eleven_session(&p, &format!("{instructions}\n{context}"), &defs);
+            let session = eleven_session(&p, &settings.language, &format!("{instructions}\n{context}"), &defs);
             let socket = match Link::open(provider, &key, session).await {
                 Ok(s) => s,
                 Err(err) => {
@@ -478,6 +478,14 @@ impl Voice {
         let mut up = jarvis_dsp::audio::Upsampler::new(3);
         let mut phase = 0;
         let mut speaking = false;
+        let mut diag = SessionDiag::new(
+            &self.id,
+            if matches!(self.id.as_str(), "grok" | "elevenlabs") {
+                24_000
+            } else {
+                16_000
+            },
+        );
         loop {
             tokio::select! {
                 biased;
@@ -530,11 +538,13 @@ impl Voice {
                     if pcm.is_empty() {
                         pcm.resize(SAMPLES_PER_TICK, 0);
                     }
-                    if matches!(self.id.as_str(), "grok" | "elevenlabs") {
+                    let has_signal = pcm.iter().any(|&s| s != 0);
+                    if diag.input_rate == 24_000 {
                         let input = up.run(&pcm);
                         pcm = input.iter().skip(phase).step_by(2).copied().collect();
                         phase = (phase + input.len()) % 2;
                     }
+                    diag.note_sent(pcm.len(), has_signal);
                     let data = B64.encode(pcm.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
                     let value = match self.id.as_str() {
                         "gemini" => json!({"realtimeInput":{"audio":{"mimeType":"audio/pcm;rate=16000","data":data}}}),
@@ -585,7 +595,11 @@ impl Voice {
                         }
                     }
                     let kind = event["type"].as_str().unwrap_or("");
+                    diag.note_event(kind);
                     if event.get("setupComplete").is_some() || ["session.started", "session.updated", "session.created"].contains(&kind) {
+                        if let Some(rate) = negotiated_input_rate(&event) {
+                            diag.input_rate = rate;
+                        }
                         if !started {
                             started = true;
                             let _ = ready.try_send(Ok(()));
@@ -612,14 +626,24 @@ impl Voice {
                         return Ok(());
                     }
                     if kind == "input_audio_buffer.speech_started" {
+                        diag.speech_started += 1;
                         self.dialog.heard_input(std::time::Instant::now());
                     }
-                    if kind == "input_audio_buffer.speech_started" || event.pointer("/serverContent/interrupted").and_then(Value::as_bool) == Some(true) {
+                    if should_interrupt_on_event(kind, speaking, &event) {
                         self.dialog.mute();
                         self.interrupted.store(true, Ordering::SeqCst);
                         speaking = false;
                     }
-                    if kind == "session.input_transcript.delta" || kind == "conversation.item.input_audio_transcription.completed" {
+                    if kind == "response.created" {
+                        self.dialog.unmute();
+                    }
+                    if matches!(
+                        kind,
+                        "session.input_transcript.delta"
+                            | "conversation.item.input_audio_transcription.delta"
+                            | "conversation.item.input_audio_transcription.completed"
+                    ) {
+                        diag.transcripts += 1;
                         self.dialog.on_user(event[if kind.ends_with("completed") { "transcript" } else { "delta" }].as_str().unwrap_or(""));
                         if kind.ends_with("completed") {
                             self.dialog.unmute();
@@ -629,6 +653,7 @@ impl Voice {
                         self.dialog.on_bot(event["delta"].as_str().unwrap_or(""));
                     }
                     if ["session.output_audio.delta", "response.audio.delta", "response.output_audio.delta"].contains(&kind) {
+                        diag.audio_chunks += 1;
                         self.audio(event["delta"].as_str().unwrap_or("")).await?;
                         speaking = true;
                     }
@@ -845,7 +870,93 @@ fn log_gemini_switch(
     }
 }
 
-fn eleven_session(profile: &Profile, instructions: &str, tools: &[Value]) -> Value {
+struct SessionDiag {
+    id: String,
+    started_at: std::time::Instant,
+    input_rate: u64,
+    sent_chunks: u64,
+    nonzero_chunks: u64,
+    sent_samples: u64,
+    events_in: u64,
+    speech_started: u64,
+    transcripts: u64,
+    audio_chunks: u64,
+    first_event_ms: Option<u128>,
+    seen_kinds: Vec<String>,
+}
+
+impl SessionDiag {
+    fn new(id: &str, input_rate: u64) -> Self {
+        Self {
+            id: id.to_owned(),
+            started_at: std::time::Instant::now(),
+            input_rate,
+            sent_chunks: 0,
+            nonzero_chunks: 0,
+            sent_samples: 0,
+            events_in: 0,
+            speech_started: 0,
+            transcripts: 0,
+            audio_chunks: 0,
+            first_event_ms: None,
+            seen_kinds: Vec::new(),
+        }
+    }
+
+    fn note_sent(&mut self, samples: usize, nonzero: bool) {
+        self.sent_chunks += 1;
+        self.sent_samples += samples as u64;
+        if nonzero {
+            self.nonzero_chunks += 1;
+        }
+    }
+
+    fn note_event(&mut self, kind: &str) {
+        self.events_in += 1;
+        if self.first_event_ms.is_none() {
+            self.first_event_ms = Some(self.started_at.elapsed().as_millis());
+        }
+        if !kind.is_empty() && self.seen_kinds.len() < 12 && !self.seen_kinds.iter().any(|k| k == kind) {
+            self.seen_kinds.push(kind.to_owned());
+        }
+    }
+}
+
+impl Drop for SessionDiag {
+    fn drop(&mut self) {
+        if self.id != "gemini" && self.sent_chunks > 0 && self.audio_chunks == 0 {
+            log::info!(
+                "{}: сессия завершилась без аудиоответа (mic_rate={}, session_rate={}, кадров={}, ненулевых={}, сэмплов={}, событий={}, первое={} мс, speech_started={}, транскриптов={}, типы=[{}])",
+                self.id,
+                crate::audio::MIC_RATE,
+                self.input_rate,
+                self.sent_chunks,
+                self.nonzero_chunks,
+                self.sent_samples,
+                self.events_in,
+                self.first_event_ms.map_or_else(|| "-".into(), |ms| ms.to_string()),
+                self.speech_started,
+                self.transcripts,
+                self.seen_kinds.join(", "),
+            );
+        }
+    }
+}
+
+fn negotiated_input_rate(event: &Value) -> Option<u64> {
+    let rate = event
+        .pointer("/session/audio/input/format/rate")
+        .or_else(|| event.pointer("/session/audio/format/rate"))
+        .and_then(Value::as_u64)?;
+    matches!(rate, 16_000 | 24_000).then_some(rate)
+}
+
+fn should_interrupt_on_event(kind: &str, speaking: bool, event: &Value) -> bool {
+    (kind == "input_audio_buffer.speech_started" && speaking)
+        || event.pointer("/serverContent/interrupted").and_then(Value::as_bool) == Some(true)
+}
+
+fn eleven_session(profile: &Profile, language: &str, instructions: &str, tools: &[Value]) -> Value {
     let model = match profile.live_model.as_str() {
         "eleven_realtime_v1_max" => "eleven_realtime_v1_max",
         _ => "eleven_realtime_v1_mini",
@@ -855,8 +966,9 @@ fn eleven_session(profile: &Profile, instructions: &str, tools: &[Value]) -> Val
     } else {
         &profile.tts_voice
     };
+    let lang = if language.trim().is_empty() { "ru" } else { language.trim() };
     json!({"type":"realtime","model":model,"instructions":instructions,"output_modalities":["audio"],"tools":tools,"max_duration_seconds":600,
-        "audio":{"input":{"format":{"type":"audio/pcm","rate":24000},"transcription":{"language":"ru"},"turn_detection":{"type":"semantic_vad","eagerness":"medium","create_response":true,"interrupt_response":true}},"output":{"format":{"type":"audio/pcm"},"voice":voice}}})
+        "audio":{"input":{"format":{"type":"audio/pcm","rate":24000},"transcription":{"language":lang},"turn_detection":{"type":"semantic_vad","eagerness":"medium","create_response":true,"interrupt_response":true}},"output":{"format":{"type":"audio/pcm"},"voice":voice}}})
 }
 
 #[cfg(test)]
@@ -869,12 +981,29 @@ mod tests {
             tts_voice: "custom-voice".into(),
             ..Default::default()
         };
-        let config = eleven_session(&p, "Jarvis", &[json!({"type":"function","name":"test"})]);
+        let config = eleven_session(&p, "ru", "Jarvis", &[json!({"type":"function","name":"test"})]);
         assert_eq!(config["model"], p.live_model);
         assert_eq!(config["audio"]["output"]["voice"], p.tts_voice);
         assert_eq!(config["audio"]["input"]["format"]["rate"], 24000);
         assert_eq!(config["tools"][0]["name"], "test");
         assert_eq!(config["instructions"], "Jarvis");
+    }
+
+    #[test]
+    fn speech_started_does_not_mute_initial_turn_before_model_speaks() {
+        let ev = json!({"type": "input_audio_buffer.speech_started"});
+        assert!(!should_interrupt_on_event("input_audio_buffer.speech_started", false, &ev));
+        assert!(should_interrupt_on_event("input_audio_buffer.speech_started", true, &ev));
+        let gemini_intr = json!({"serverContent": {"interrupted": true}});
+        assert!(should_interrupt_on_event("", false, &gemini_intr));
+        assert_eq!(
+            negotiated_input_rate(&json!({"type":"session.created","session":{"audio":{"input":{"format":{"type":"audio/pcm","rate":16000}}}}})),
+            Some(16_000)
+        );
+        assert_eq!(
+            negotiated_input_rate(&json!({"type":"session.created","session":{"audio":{"input":{"format":{"type":"audio/pcm","rate":24000}}}}})),
+            Some(24_000)
+        );
     }
 }
 

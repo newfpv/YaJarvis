@@ -16,7 +16,7 @@ const RULES: &[(&str, &str, &[&str])] = &[
     ("midi", "Яндекс Станция Миди", &["cucumber"]),
     ("station3", "Яндекс Станция 3", &["orion"]),
     ("lite2", "Яндекс Станция Лайт 2", &["plum", "yandex,prune", "lite 2", "лайт 2", "lite2", "micro2", "micro_2", "micro-2"]),
-    ("street", "Яндекс Станция Стрит", &["mango"]),
+    ("street", "Яндекс Станция Стрит", &["mango", "dmpv", "street"]),
     ("fiero", "Fiero Hi", &["blackthorn", "fiero"]),
     ("mini2", "Яндекс Станция Мини 2", &["station-mini2", "station-mini-2", "yandexmini_2", "mini 2", "мини 2"]),
     ("station2", "Яндекс Станция 2", &["station-midi", "yandexmidi", "station midi"]),
@@ -73,6 +73,8 @@ mod tests {
         assert_eq!(detect("yandex,station-micro", "", "", "").id, "lite");
         assert_eq!(detect("", "", "yandexmidi", "").id, "station2");
         assert_eq!(detect("amlogic,cucumber", "", "", "").id, "midi");
+        assert_eq!(detect("yandex,mango", "", "", "").id, "street");
+        assert_eq!(detect("", "", "", "Yandex-Station-Street-DMPV").id, "street");
         assert_eq!(detect("", "", "", "").id, "unknown");
     }
 }

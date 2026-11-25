@@ -253,14 +253,27 @@ fn normalize_bind(addr: &str) -> String {
 }
 
 async fn bind_listener(addr: &str, explicit: bool) -> std::io::Result<(tokio::net::TcpListener, u16, bool)> {
+    bind_listener_for(addr, explicit, crate::hardware::station_model().id).await
+}
+
+async fn bind_listener_for(addr: &str, explicit: bool, model_id: &str) -> std::io::Result<(tokio::net::TcpListener, u16, bool)> {
     let primary = normalize_bind(addr);
+    let host = primary.rsplit_once(':').map(|(h, _)| h).unwrap_or("0.0.0.0");
+    // На Станции Стрит порт 8080 занимает штатный maind --platformd; при загрузке S98jarvisd стартует раньше
+    // S99quasar, поэтому без этого правила порт прыгает с 8088 на 8080 и перехватывает порт у системы (#37).
+    if !explicit && model_id == "street" && primary.ends_with(":8080") {
+        for &port in FALLBACK_PORTS {
+            if let Ok(listener) = tokio::net::TcpListener::bind(format!("{host}:{port}")).await {
+                return Ok((listener, port, true));
+            }
+        }
+    }
     match tokio::net::TcpListener::bind(&primary).await {
         Ok(listener) => {
             let port = listener.local_addr()?.port();
             Ok((listener, port, false))
         }
         Err(err) if !explicit && err.kind() == std::io::ErrorKind::AddrInUse => {
-            let host = primary.rsplit_once(':').map(|(h, _)| h).unwrap_or("0.0.0.0");
             for &port in FALLBACK_PORTS {
                 if let Ok(listener) = tokio::net::TcpListener::bind(format!("{host}:{port}")).await {
                     return Ok((listener, port, true));
@@ -314,5 +327,11 @@ mod tests {
         assert!(FALLBACK_PORTS.contains(&bound_port));
         drop(listener);
         drop(busy);
+
+        // На Станции Стрит порт 8080 пропускается заранее, чтобы не перехватывать его у maind --platformd при загрузке.
+        let (street_listener, street_port, street_fallback) = bind_listener_for("127.0.0.1:8080", false, "street").await.unwrap();
+        assert!(street_fallback);
+        assert!(FALLBACK_PORTS.contains(&street_port));
+        drop(street_listener);
     }
 }

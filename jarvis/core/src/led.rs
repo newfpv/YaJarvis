@@ -471,7 +471,15 @@ impl Inner {
         if mode == Mode::Off {
             let St { chans, clock, saved, .. } = &mut *st;
             for c in chans.iter_mut() {
-                write(&c.path, saved.get(&c.path).copied().unwrap_or(0).max(0));
+                // Для каналов со штатным триггером ядра (ledfb-logo на Мини 3, led_ring_fb на Лайт 2)
+                // чтение brightness до захвата может вернуть 255 — гасим в 0 перед возвратом триггера,
+                // иначе при возврате триггера кольцо может остаться гореть белым.
+                let val = if !c.trig.is_empty() {
+                    0
+                } else {
+                    saved.get(&c.path).copied().unwrap_or(0).max(0)
+                };
+                write(&c.path, val);
                 c.last = -1;
             }
             for c in clock.iter_mut() {
@@ -499,10 +507,77 @@ impl Inner {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn colors() {
         let c = super::color("#ff8000", 50);
         assert!((c["red"] - 0.5).abs() < 1e-9 && (c["green"] - 0.5 * 128.0 / 255.0).abs() < 1e-9 && c["blue"] == 0.0);
         assert_eq!(super::current_trigger("none [led_ring_fb] timer"), "led_ring_fb");
+    }
+
+    #[test]
+    fn triggered_channels_clear_to_zero_before_restoring_trigger() {
+        let dir = std::env::temp_dir().join(format!("jarvis-led-test-{}", crate::settings::rand_hex(6)));
+        let trig_led = dir.join("bergamot_red_logo0");
+        let plain_led = dir.join("mini2_red_ring1");
+        std::fs::create_dir_all(&trig_led).unwrap();
+        std::fs::create_dir_all(&plain_led).unwrap();
+        std::fs::write(trig_led.join("brightness"), "255").unwrap();
+        std::fs::write(trig_led.join("trigger"), "none [ledfb-logo] timer").unwrap();
+        std::fs::write(plain_led.join("brightness"), "12").unwrap();
+        std::fs::write(plain_led.join("trigger"), "[none] timer").unwrap();
+
+        let now = Instant::now();
+        let inner = Inner {
+            st: Mutex::new(St {
+                palette: default_palette(),
+                off: false,
+                stopped: false,
+                chans: vec![
+                    Chan {
+                        path: trig_led.join("brightness"),
+                        color: "red".into(),
+                        color_idx: 0,
+                        max: 255,
+                        group: 0,
+                        last: -1,
+                        trig: String::new(),
+                    },
+                    Chan {
+                        path: plain_led.join("brightness"),
+                        color: "red".into(),
+                        color_idx: 0,
+                        max: 255,
+                        group: 1,
+                        last: -1,
+                        trig: String::new(),
+                    },
+                ],
+                clock: vec![],
+                saved: HashMap::new(),
+                mode: Mode::Off,
+                until: None,
+                groups: 2,
+                since: now,
+                level: 0.0,
+                target: 0.0,
+                hear: 0.0,
+                hear_t: 0.0,
+                frames: 0,
+                lvl_at: now,
+                phase: Mode::Off,
+            }),
+            wake: Condvar::new(),
+            source: Box::new(crate::settings::default_led),
+        };
+
+        inner.set_inner(Mode::Listening, false);
+        assert_eq!(std::fs::read_to_string(trig_led.join("trigger")).unwrap(), "none");
+        inner.set_inner(Mode::Off, false);
+        assert_eq!(std::fs::read_to_string(trig_led.join("brightness")).unwrap(), "0");
+        assert_eq!(std::fs::read_to_string(trig_led.join("trigger")).unwrap(), "ledfb-logo");
+        assert_eq!(std::fs::read_to_string(plain_led.join("brightness")).unwrap(), "12");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -1572,6 +1572,7 @@ impl Engine {
             return Err(missing);
         }
         let t0 = Instant::now();
+        const READ_ALOUD: &str = "Ты озвучиваешь готовый текст. Произнеси ровно то, что тебе дали, ничего не добавляя, и замолчи.";
         let sess: Arc<dyn Session> = if p.is_classic() {
             crate::classic_voice::Classic::open_with(
                 &self.rt,
@@ -1580,10 +1581,26 @@ impl Engine {
                 Arc::new(Journal::default()),
                 s.clone(),
                 p.clone(),
-                "Ты озвучиваешь готовый текст. Произнеси ровно то, что тебе дали, ничего не добавляя, и замолчи.".into(),
+                READ_ALOUD.into(),
                 self.listener.phrase(),
                 Some(self.gemini_pool.clone()),
                 Some(self.proxy.clone()),
+            )
+        } else if ["", "live", "openai", "gemini", "grok", "eleven_realtime"].contains(&p.engine.as_str()) {
+            crate::cloud_voice::Voice::open_with(
+                &self.rt,
+                self.host.clone(),
+                None,
+                Arc::new(Journal::default()),
+                s.clone(),
+                p.clone(),
+                READ_ALOUD.into(),
+                crate::cloud_voice::VoiceOptions {
+                    gemini_pool: Some(self.gemini_pool.clone()),
+                    store: Some(self.store.clone()),
+                    proxy: Some(self.proxy.clone()),
+                    allow_failover: true,
+                },
             )
         } else {
             chatgpt::ChatGptSession::open(
@@ -1592,7 +1609,7 @@ impl Engine {
                     host: self.host.clone(),
                     voice: p.voice.clone(),
                     thread: self.chat_thread().into(),
-                    instructions: "Ты озвучиваешь готовый текст. Произнеси ровно то, что тебе дали, ничего не добавляя, и замолчи.".into(),
+                    instructions: READ_ALOUD.into(),
                     brain: None,
                     journal: Arc::new(Journal::default()),
                     memory: None,
@@ -1606,7 +1623,23 @@ impl Engine {
         res
     }
 
+    fn clear_say_leds(&self, active: bool) {
+        if active && !self.st.lock().unwrap_or_else(|p| p.into_inner()).busy {
+            self.leds.set(Mode::Off);
+        }
+    }
+
     fn play_said(&self, sess: &dyn Session, text: &str, limit: Duration, t0: Instant, epoch: u64) -> Result<(), String> {
+        struct SayLedGuard<'a> {
+            engine: &'a Engine,
+            active: bool,
+        }
+        impl Drop for SayLedGuard<'_> {
+            fn drop(&mut self) {
+                self.engine.clear_say_leds(self.active);
+            }
+        }
+        let mut led_guard = SayLedGuard { engine: self, active: false };
         sess.ready(Duration::from_secs(10).min(limit))?;
         if self.speech_epoch.load(Ordering::SeqCst) != epoch { return Err(INTERRUPTED.into()); }
         sess.say(text)?;
@@ -1640,6 +1673,7 @@ impl Engine {
                         // плеер — только с первым звуком, а не пока модель думает
                         self.start_voice(sess)?;
                         self.leds.set(Mode::Speaking);
+                        led_guard.active = true;
                         let _ = self.player.write(&vec![0; sess.rate() / 4]);
                         started = true;
                     }
@@ -2179,5 +2213,48 @@ mod tests {
         assert!(!super::should_wake_interrupt(true, true, false, Some(now - ms(800)), 0.72, now));
         // Уверенный оклик после окна сходимости — перебиваем.
         assert!(super::should_wake_interrupt(true, true, false, Some(now - ms(800)), 0.92, now));
+    }
+
+    #[tokio::test]
+    async fn play_said_clears_leds_after_finishing_when_idle() {
+        let dir = std::env::temp_dir().join(format!("jarvis-say-led-{}", crate::settings::rand_hex(6)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = super::Store::open(dir.join("settings.json")).unwrap();
+        let host = super::Host::new(dir.clone(), crate::plugins::Hooks::default());
+        let proxy = crate::vpn::Proxy::new(store.clone());
+        let mic = super::Mic::new(dir.join("mic.sock"), Box::new(|| 0));
+        let player = super::Player::new(Box::new(|| 40), Box::new(|| 1.0));
+        let leds = super::Leds::new(Box::new(crate::settings::default_led));
+        let journal = std::sync::Arc::new(super::Journal::default());
+        let tools = std::sync::Arc::new(super::Tools::new(host.clone(), store.clone()));
+        let (listener, _) = super::Listener::new(&dir, &store, false);
+        let music = std::sync::Arc::new(crate::music::Music::default());
+        let engine = super::Engine::new(
+            tokio::runtime::Handle::current(),
+            store,
+            host,
+            proxy,
+            mic,
+            player,
+            leds.clone(),
+            journal,
+            tools,
+            listener,
+            dir.clone(),
+            music,
+        );
+
+        // После озвучки из панели (st.busy == false) подсветка должна вернуться в Mode::Off.
+        leds.set(super::Mode::Speaking);
+        assert_eq!(leds.phase(), super::Mode::Speaking);
+        engine.clear_say_leds(true);
+        assert_eq!(leds.phase(), super::Mode::Off);
+
+        // Если озвучку перебила новая активация разговора (st.busy == true), чужой Mode::Listening не сбрасываем.
+        engine.st.lock().unwrap().busy = true;
+        leds.set(super::Mode::Listening);
+        engine.clear_say_leds(true);
+        assert_eq!(leds.phase(), super::Mode::Listening);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

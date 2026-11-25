@@ -174,7 +174,7 @@ impl Player {
             .args(["-q", "-D", "default", "-t", "raw", "-f", "S16_LE", "-r", &out.to_string(), "-c", "1"])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()?;
         let stdin = child.stdin.take().unwrap();
         let (tx, rx) = sync_channel::<Vec<u8>>(512);
@@ -246,9 +246,29 @@ impl Player {
 fn pump(mut stdin: ChildStdin, rx: Receiver<Vec<u8>>) {
     use std::io::Write;
     for b in rx {
-        if stdin.write_all(&b).is_err() {
+        if let Err(e) = stdin.write_all(&b) {
+            log::warn!("динамик (aplay): ошибка записи ({e})");
             return; // плеер умер — остаток выбрасываем (rx закроется вместе с потоком)
         }
+    }
+}
+
+fn log_aplay_exit(child: &mut Child, status: std::process::ExitStatus) {
+    if status.success() {
+        return;
+    }
+    // Если процесс завершился не по нашему SIGINT, а сам с кодом ошибки — покажем stderr ALSA в журнале.
+    let Some(code) = status.code() else { return };
+    use std::io::Read;
+    let mut err = String::new();
+    if let Some(stderr) = child.stderr.as_mut() {
+        let _ = stderr.take(512).read_to_string(&mut err);
+    }
+    let detail = err.trim().replace('\n', " | ");
+    if detail.is_empty() {
+        log::warn!("динамик (aplay): завершился с кодом {code}");
+    } else {
+        log::warn!("динамик (aplay): код {code}: {detail}");
     }
 }
 
@@ -264,13 +284,16 @@ fn interrupt(child: &Child) {
 fn wait_child(child: &mut Child, timeout: Duration) {
     let t0 = Instant::now();
     loop {
-        if let Ok(Some(_)) = child.try_wait() {
+        if let Ok(Some(status)) = child.try_wait() {
+            log_aplay_exit(child, status);
             return;
         }
         if t0.elapsed() > timeout {
             interrupt(child);
             thread::sleep(Duration::from_secs(1));
-            if !matches!(child.try_wait(), Ok(Some(_))) {
+            if let Ok(Some(status)) = child.try_wait() {
+                log_aplay_exit(child, status);
+            } else {
                 let _ = child.kill();
                 let _ = child.wait();
             }

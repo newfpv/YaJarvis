@@ -56,10 +56,16 @@ struct Flags {
     data: PathBuf,
     mic: PathBuf,
     listen: String,
+    listen_explicit: bool,
 }
 
 fn flags() -> Flags {
-    let mut f = Flags { data: "/data/opt/jarvisd".into(), mic: "/tmp/jarvisd/mic.sock".into(), listen: ":8080".into() };
+    let mut f = Flags {
+        data: "/data/opt/jarvisd".into(),
+        mic: "/tmp/jarvisd/mic.sock".into(),
+        listen: ":8080".into(),
+        listen_explicit: false,
+    };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let a = a.trim_start_matches('-');
@@ -71,9 +77,19 @@ fn flags() -> Flags {
         match k.as_str() {
             "data" => f.data = val().into(),
             "mic" => f.mic = val().into(),
-            "listen" => f.listen = val(),
+            "listen" => {
+                f.listen = val();
+                f.listen_explicit = true;
+            }
             _ => {}
         }
+    }
+    if !f.listen_explicit
+        && let Ok(custom) = std::fs::read_to_string(f.data.join("listen"))
+        && !custom.trim().is_empty()
+    {
+        f.listen = custom.trim().to_string();
+        f.listen_explicit = true;
     }
     f
 }
@@ -355,7 +371,7 @@ async fn run(f: Flags, store: settings::Store) {
         buttons::watch(move || web::buttons_reset(&app));
     }
     tokio::spawn(counter::run(store.clone(), f.data.clone()));
-    if let Err(e) = web::serve(app, &f.listen).await {
+    if let Err(e) = web::serve(app, &f.listen, f.listen_explicit).await {
         log::info!("веб-настройки: {e}");
         host.stop_all().await;
         std::process::exit(1);

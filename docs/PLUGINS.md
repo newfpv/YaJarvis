@@ -21,7 +21,12 @@
   - [5.6. Свои распознавание и озвучка (`provides: ["stt"]` и `["tts"]`)](#56-свои-распознавание-и-озвучка-provides-stt-и-tts)
   - [5.7. Готовые шаблоны кода](#57-готовые-шаблоны-кода)
 - [6. Разработка Rust-плагинов (`kind: "rust"` и `kind: "module"`)](#6-разработка-rust-плагинов-kind-rust-и-kind-module)
+  - [6.1. Минимальный рабочий шаблон](#61-минимальный-рабочий-шаблон)
+  - [6.2. Протокол RPC, форматы и таймауты](#62-протокол-rpc-форматы-и-таймауты)
+  - [6.3. Частые грабли Rust-плагинов](#63-частые-грабли-rust-плагинов)
+  - [6.4. Сборка `arm64` / `armv7` и упаковка ZIP](#64-сборка-arm64--armv7-и-упаковка-zip)
 - [7. Публикация плагина в каталог GitHub](#7-публикация-плагина-в-каталог-github)
+  - [Чеклист перед публикацией](#чеклист-перед-публикацией)
 - [8. Отладка и частые ошибки](#8-отладка-и-частые-ошибки)
 
 ---
@@ -99,11 +104,11 @@
 | `author` | `string` | Рекомендуется | Имя или ник автора. |
 | `homepage` | `string` | Опционально | Ссылка на репозиторий или документацию. |
 | `kind` | `string` | **Да** | `"lua"` или `"rust"` (также `"module"` для встроенных в ядро сборок). Устаревшие `"js"` и `"native"` больше не поддерживаются. |
-| `main` | `string` | **Да** | Имя входного файла внутри архива (например, `"main.lua"` для Lua или `"my-plugin"` для Rust). Для Rust — строго имя файла без `/` и не зарезервированное (`data`, `data.json`, `plugin.json`, `.`). |
-| `arch` | `string` | Для `rust` | Целевая архитектура: `"arm64"` или `"armv7"` (при установке проверяется реальный ELF-заголовок бинарника). |
+| `main` | `string` | **Да** | Имя входного файла внутри архива (например, `"main.lua"` для Lua или `"my-plugin"` для Rust). Для Rust: строго имя файла без `/` и не зарезервированное (`data`, `data.json`, `plugin.json`, `.`). При распаковке ядро само ставит права `0700` на `main`, а остальные файлы архива получают `0644` (скрипты рядом запускайте через `/bin/sh`). |
+| `arch` | `string` | Для `rust` | Целевая архитектура: `"arm64"` или `"armv7"`. При установке ядро проверяет реальный ELF-заголовок бинарника! В `jarvis-plugin-armv7.zip` в `plugin.json` обязательно должно быть `"arch": "armv7"`. |
 | `api` | `integer` | **Да** | Версия API плагинов. Сейчас актуальна **`1`**. |
 | `category` | `string` | **Да** | Одна из 9 допустимых категорий (см. таблицу ниже). |
-| `icon` | `string` | Опционально | Имя иконки интерфейса (например: `puzzle`, `cloud`, `bolt`, `home`, `music`, `mic`, `shield`). |
+| `icon` | `string` | Опционально | Имя встроенной иконки панели. Доступные имена: `puzzle`, `shield`, `cloud`, `wifi`, `home`, `bolt`, `music`, `radio`, `mic`, `speaker`, `voice`, `moon`, `heart`, `search`, `tune`, `link`, `list`, `refresh`, `play`, `done`. Любое другое имя молча заменится на `puzzle`. |
 | `provides` | `string[]` | Опционально | Возможности плагина: `"tools"`, `"commands"`, `"llm"`, `"stt"`, `"tts"`. (Значения `"vpn"` и ID официальных систем умного дома разрешены только официальным плагинам.) |
 | `permissions` | `string[]` | Для Lua | Запрашиваемые права: `"tools"`, `"commands"`, `"say"`, `"network"`, `"storage"`, `"timers"`. |
 | `network_allow` | `string[]` | Если есть `network` | Белый список доменов/origin для `jarvis.fetch`: точный хост (`api.example.com`), origin (`https://api.example.com:8443`) или поддомены (`*.example.com`). |
@@ -418,45 +423,277 @@ return {
 
 ## 6. Разработка Rust-плагинов (`kind: "rust"` и `kind: "module"`)
 
-Когда возможностей Lua недостаточно, соберите нативный бинарный плагин с помощью крейта **`jarvis-plugin-sdk`** (`process` feature):
+Когда возможностей Lua недостаточно (нужны системные вызовы, бинарные протоколы, сокеты, криптография или скрипты на колонке), соберите нативный бинарный плагин с помощью крейта **`jarvis-plugin-sdk`** с feature `process`.
 
-1. Подключите `jarvis-plugin-sdk` и реализуйте трейт `Plugin` (в `main` вызовите `process::serve`). Готовый минимальный пример — [`jarvis/plugin-sdk/examples/process_echo.rs`](../jarvis/plugin-sdk/examples/process_echo.rs).
-2. **Важно:** `stdout` полностью зарезервирован под бинарный RPC-протокол обмена с ядром — весь отладочный вывод пишите строго в **`stderr`** (`eprintln!`, `log`).
-3. Соберите статический бинарник под Linux `musl`:
-   - для **ARM64** (Станция Лайт, Мини 2/3, Миди, Станция 2/3): `aarch64-unknown-linux-musl` (`"arch": "arm64"`);
-   - для **ARMv7** (часть моделей Станции Мини 1 / др.): `armv7-unknown-linux-musleabihf` (`"arch": "armv7"`).
-4. Положите бинарник (например, `my_plugin`) и `plugin.json` (`"kind": "rust"`, `"api": 1`, `"arch": "arm64"`, `"main": "my_plugin"`) в корень архива `jarvis-plugin-arm64.zip` (и аналогично `jarvis-plugin-armv7.zip`).
-5. Рабочая директория процесса при запуске — `<data_dir>/plugins/<id>/data`. При обновлении плагина содержимое `data/` и `data.json` автоматически переносится в новую версию.
+### 6.1. Минимальный рабочий шаблон
 
-Подробные детали SDK и встраивания `kind: "module"` — в **[NATIVE-PLUGINS.md](NATIVE-PLUGINS.md)**.
+Подключите SDK в `Cargo.toml`:
+
+```toml
+[dependencies]
+jarvis-plugin-sdk = { git = "https://github.com/newfpv/YaJarvis", package = "jarvis-plugin-sdk", features = ["process"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "macros", "process", "sync"] }
+```
+
+Полный рабочий каркас `src/main.rs` с настройками, быстрой командой, инструментом LLM, фоновой задачей и запуском системного скрипта:
+
+```rust
+use jarvis_plugin_sdk::{Map, Plugin, Response, Value, json, process};
+use std::sync::{Arc, RwLock};
+use tokio::process::Command;
+
+// Окружение процесса очищено (env_clear), поэтому PATH задаём явно!
+const DEFAULT_PATH: &str = "/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+#[derive(Clone)]
+struct State {
+    enabled: bool,
+}
+
+struct MyPlugin {
+    state: Arc<RwLock<State>>,
+}
+
+impl MyPlugin {
+    fn from_settings(settings: &Map<String, Value>) -> State {
+        State {
+            enabled: settings.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+        }
+    }
+}
+
+impl Plugin for MyPlugin {
+    // ВАЖНО: формат ПЛОСКИЙ (без вложенного ключа "function"!)
+    // tools() вызывается один раз при init.
+    fn tools(&self) -> Vec<Value> {
+        vec![json!({
+            "type": "function",
+            "name": "my_plugin_status",
+            "description": "Показывает статус сервиса моего плагина",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "verbose": { "type": "boolean", "description": "Подробный вывод" }
+                }
+            }
+        })]
+    }
+
+    // Вызывается при сохранении настроек в панели (без перезапуска процесса)
+    fn configure(&self, settings: Map<String, Value>) {
+        if let Ok(mut st) = self.state.write() {
+            *st = Self::from_settings(&settings);
+        }
+    }
+
+    fn request(&self, method: &str, params: Value) -> Response<'_> {
+        // Копируем method до Box::pin, иначе borrow checker ругнётся на lifetime &str
+        let method = method.to_owned();
+        let state = self.state.clone();
+
+        Box::pin(async move {
+            match method.as_str() {
+                "command" => {
+                    let text = params.as_str().unwrap_or("");
+                    match text {
+                        "статус сервиса" => Ok(json!("Сервис работает")),
+                        "запусти долгую задачу" => {
+                            // Таймаут command = 2 с! Долгие операции уносим в фон:
+                            tokio::spawn(async move {
+                                let out = Command::new("/bin/sh")
+                                    .args(["-c", "echo ok"])
+                                    .env("PATH", DEFAULT_PATH)
+                                    .output()
+                                    .await;
+                                eprintln!("my-plugin: bg done: {:?}", out.map(|o| o.status));
+                            });
+                            Ok(json!("Запустил задачу в фоне"))
+                        }
+                        // Не наша фраза -> обязательно возвращаем Value::Null!
+                        _ => Ok(Value::Null),
+                    }
+                }
+                "tool" => {
+                    let name = params["name"].as_str().unwrap_or("");
+                    let _args = &params["arguments"];
+                    match name {
+                        "my_plugin_status" => {
+                            let on = state.read().map(|s| s.enabled).unwrap_or(false);
+                            Ok(json!(if on { "Включён" } else { "Выключен" }))
+                        }
+                        // При реальной ошибке возвращаем Err(...), а не Ok("ошибка...")
+                        _ => Err(format!("Неизвестный инструмент: {name}")),
+                    }
+                }
+                _ => Ok(Value::Null),
+            }
+        })
+    }
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> std::io::Result<()> {
+    process::serve(|init| {
+        let state = MyPlugin::from_settings(&init.settings);
+        Ok(Box::new(MyPlugin {
+            state: Arc::new(RwLock::new(state)),
+        }))
+    })
+    .await
+}
+```
+
+Минимальный пример с `llm.chat` также лежит в [`jarvis/plugin-sdk/examples/process_echo.rs`](../jarvis/plugin-sdk/examples/process_echo.rs).
+
+### 6.2. Протокол RPC, форматы и таймауты
+
+Ядро общается с процессом по `stdin`/`stdout` (JSON-фреймы до 4 МБ, вызовы приходят **последовательно**, очередь 8 запросов). Если любой вызов превысил свой таймаут или сломал фрейм, **ядро принудительно убивает процесс плагина**.
+
+| Метод | Что приходит в `params` | Что вернуть | Таймаут |
+| :--- | :--- | :--- | :--- |
+| `init` | `Init { settings, info }` в замыкании `process::serve` | `Ok(Box::new(plugin))` или `Err("причина")` | **5 с** (при ошибке/таймауте установка откатывается!) |
+| `configure` | `Map<String, Value>` в `Plugin::configure()` | ничего (обновите внутренний `RwLock`/`Mutex`) | **5 с** |
+| `command` | JSON-строка с нормализованной фразой (нижний регистр, `ё -> е`, без пунктуации и без «джарвис») | `Ok(json!("Ответ"))` или `Ok(Value::Null)` если фраза не ваша | **2 с** |
+| `tool` | `{"name": "<tool_name>", "arguments": { ... }}` | `Ok(json!("Результат"))` или `Err("описание ошибки")` | **15 с** |
+| `llm.chat` | `{ messages, model, tools }` (как в Lua `chat`) | Строка или `{ text, tool_calls }` | **30 с** |
+| `stt.transcribe` | `{ audio_b64, format, rate, model, language }` | `{ text: "..." }` или строка | **45 с** |
+| `tts.speak` | `{ text, voice, model, language }` | `{ audio: "<base64 PCM16>", rate: 24000 }` | **45 с** |
+| `shutdown` | обрабатывается SDK автоматически, вызывается `Plugin::stop()` | завершение процесса | **1 с** |
+
+### 6.3. Частые грабли Rust-плагинов
+
+Прочитайте эти 7 пунктов перед сборкой релиза. Почти все проблемы сторонних Rust-плагинов связаны именно с ними:
+
+1. **Формат `Plugin::tools()` должен быть ПЛОСКИМ!**
+   Ядро проверяет на верхнем уровне `tool["type"] == "function"`, валидность `tool["name"]` и `tool["parameters"].is_object()`.
+   - ❌ **Неправильно** (формат OpenAI Chat Completions, ядро **молча отбросит все инструменты**!):
+     ```json
+     { "type": "function", "function": { "name": "my_tool", "description": "...", "parameters": { "type": "object", "properties": {} } } }
+     ```
+   - ✅ **Правильно** (плоский формат):
+     ```json
+     { "type": "function", "name": "my_tool", "description": "...", "parameters": { "type": "object", "properties": {} } }
+     ```
+   Имя инструмента: `[a-zA-Z0-9_-]`, длина 1..64, нельзя перекрывать встроенные `CORE_TOOLS`. Максимум 64 инструмента.
+
+2. **Процесс запускается с пустым окружением (`env_clear()`).**
+   Переменные `PATH`, `HOME`, `TMPDIR` у вашего плагина **пустые**. Вызов `Command::new("sh")` или использование `pgrep`, `pidof`, `iptables`, `curl` внутри шелл-скриптов упадёт с `No such file or directory` / `not found`.
+   Всегда запускайте `/bin/sh` по полному пути и передавайте `.env("PATH", "/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin")`.
+
+3. **Жёсткий таймаут 2 секунды на `command` (и 5 секунд на `init`).**
+   Нельзя синхронно скачивать файлы, ставить пакеты или запускать долгие скрипты внутри `init`, `command` или `tool`: ядро убьёт процесс по таймауту. Используйте асинхронный `tokio::process::Command` (а не блокирующий `std::process::Command`) и выносите долгие операции в `tokio::spawn`, сразу возвращая короткий ответ.
+
+4. **`stdout` зарезервирован под бинарный RPC-протокол.**
+   Любой `println!` (или дочерний процесс с унаследованным `stdout`) сломает обмен и приведёт к `Rust-плагин не подтвердил запуск`. Все логи пишите строго в **`stderr`** (`eprintln!`, `log`), они попадут в системный журнал колонки.
+
+5. **Возвращайте `Err(...)` при сбое.**
+   Если инструмент или скрипт завершился с ненулевым кодом, возвращайте `Err("текст ошибки".into())` (ядро обрежет до 300 символов и передаст ошибку модели/панели), а не `Ok(json!("ошибка ..."))`.
+
+6. **Рабочая папка, пути и права файлов.**
+   - Текущая директория процесса (`std::env::current_dir()`) при запуске: `/data/opt/jarvisd/plugins/<id>/data`.
+   - Всё внутри `data/` и файл `../data.json` **сохраняются при обновлении плагина**.
+   - Остальные файлы из вашего ZIP лежат на уровень выше (`current_dir().parent()`), перезаписываются при обновлении и имеют права `0644` (не исполняемые; права `0700` ядро выдаёт только самому бинарнику `main`).
+
+7. **Лайфтайм `method: &str` в `Plugin::request`.**
+   Сигнатура `fn request(&self, method: &str, params: Value) -> Response<'_>` привязывает время жизни `Future` к `&self`, а не к `method`. Скопируйте `let method = method.to_owned();` (или разберите `match method`) **до** `Box::pin(async move { ... })`.
+
+### 6.4. Сборка `arm64` / `armv7` и упаковка ZIP
+
+Соберите статические бинарники под Linux `musl`:
+- **ARM64** (Станция Лайт 1/2, Мини 2/3, Миди, Станция 2/3): `aarch64-unknown-linux-musl` -> `"arch": "arm64"`, файл релиза **`jarvis-plugin-arm64.zip`**.
+- **ARMv7** (часть моделей Станции Мини 1 и 32-битные платы): `armv7-unknown-linux-musleabihf` -> `"arch": "armv7"`, файл релиза **`jarvis-plugin-armv7.zip`**.
+
+**Важно:** в каждом архиве `plugin.json` должен содержать **свой** `"arch"`! Частая ошибка в `build.sh` это копировать один `plugin.json` с `"arch": "arm64"` в оба ZIP-архива, из-за чего установка на `armv7` падает на проверке ELF.
+
+Пример правильного `build.sh` (через `cargo-zigbuild` или `cross`):
+
+```sh
+#!/bin/sh
+set -eu
+
+BIN="my-plugin"
+
+pack() {
+  target="$1"
+  arch="$2"
+  out="dist/$arch"
+  zipname="jarvis-plugin-$arch.zip"
+
+  cargo zigbuild --release --target "$target"
+  rm -rf "$out"
+  mkdir -p "$out"
+  cp "target/$target/release/$BIN" "$out/$BIN"
+  # Подставляем правильный arch именно для этого архива!
+  sed "s/\"arch\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"arch\": \"$arch\"/" plugin.json > "$out/plugin.json"
+
+  rm -f "$zipname"
+  (cd "$out" && zip -r "../../$zipname" .)
+}
+
+pack aarch64-unknown-linux-musl arm64
+pack armv7-unknown-linux-musleabihf armv7
+```
+
+Подробности про встраивание `kind: "module"` в кастомную сборку ядра: **[NATIVE-PLUGINS.md](NATIVE-PLUGINS.md)**.
 
 ---
 
 ## 7. Публикация плагина в каталог GitHub
 
-Чтобы любой пользователь YaJarvis видел ваш плагин во вкладке **Подключения → Плагины → Неофициальные** и мог поставить/обновить его в один клик:
+Чтобы любой пользователь YaJarvis видел ваш плагин во вкладке **Подключения -> Плагины -> Неофициальные** и мог поставить или обновить его в один клик:
 
-1. Выложите исходный код плагина в публичный репозиторий на GitHub (рекомендуемое имя `yajarvis-<id>` или `jarvis-<id>`).
-2. В настройках репозитория (**About → Topics**) добавьте тему **`yajarvis-plugin`** и тему вашей категории, например **`yajarvis-info`**, **`yajarvis-fun`**, **`yajarvis-home`** и т.д. (список тем выше).
-3. В репозитории создайте **GitHub Release** (раздел **Releases → Create a new release**) и прикрепите ZIP-архив(ы):
-   - для кросс-платформенного Lua-плагина: **`jarvis-plugin.zip`** (в корне или одной папке `plugin.json` и `main.lua`);
-   - для нативного Rust-плагина: **`jarvis-plugin-arm64.zip`** и/или **`jarvis-plugin-armv7.zip`**.
-4. Колонка ищет эти файлы в **последнем опубликованном релизе** (`releases/latest`) вашего репозитория.
-5. Проверьте установку локально на своей колонке через загрузку `.zip` в панели, убедитесь в отсутствии ошибок в журнале, а при выпуске обновлений просто повышайте `version` в `plugin.json` и публикуйте новый релиз.
+1. **Создайте обычный публичный репозиторий на GitHub (НЕ форк!).**
+   - Если вы делаете плагин на основе чужого репозитория, не жмите кнопку **Fork** на GitHub. Создайте новый чистый репозиторий и залейте код туда (укажите первоисточник в README).
+   - Почему это важно: на прошивках `0.10.20` и ниже GitHub Search API по умолчанию **исключает форки** из выдачи по теме `yajarvis-plugin`, и плагин вообще не появится в каталоге. Начиная с `0.10.21` форки с явно добавленной темой тоже подхватываются, но самостоятельный репозиторий работает сразу у **всех** пользователей на любых версиях.
+   - Репозиторий должен быть **публичным** и **не архивным** (`archived: false`).
+   - Рекомендуемое имя репозитория: **`yajarvis-<id>`** (или `yajarvis-plugin-<id>`), где `<id>` совпадает с полем `id` в `plugin.json`. Тогда на всех версиях (включая `0.10.20` и ниже) карточка установленного плагина не задублируется с карточкой каталога.
+
+2. **Добавьте темы (Topics) в настройках репозитория (About -> шестерёнка -> Topics):**
+   - обязательная тема: **`yajarvis-plugin`**;
+   - одна тема категории: `yajarvis-assistant`, `yajarvis-home`, `yajarvis-media`, `yajarvis-info`, `yajarvis-productivity`, `yajarvis-dev`, `yajarvis-fun`, `yajarvis-system` или `yajarvis-other`.
+
+3. **Опубликуйте GitHub Release (Releases -> Draft a new release -> Publish release):**
+   - Релиз должен быть **полноценным опубликованным релизом** (НЕ Draft и НЕ Pre-release, иначе API `/releases/latest` вернёт 404).
+   - Прикрепите к релизу ZIP-архивы со **строго точными именами**:
+     - для Lua-плагина: **`jarvis-plugin.zip`**;
+     - для Rust-плагина: **`jarvis-plugin-arm64.zip`** и/или **`jarvis-plugin-armv7.zip`**.
+   - Ядро ищет сначала `jarvis-plugin-<arch>.zip`, затем `jarvis-plugin.zip`. Любые другие имена (например `my-plugin-1.0.zip` или автоматический `Source code (zip)`) игнорируются.
+
+4. **Кеш каталога:** колонка кеширует каталог сообщества на **1 час** (ошибки на 5 минут). Чтобы увидеть только что опубликованный плагин сразу, нажмите кнопку обновления каталога в панели.
+
+5. **Обновления:** при выходе новой версии поднимите `version` в `plugin.json`, пересоберите ZIP и опубликуйте новый Release. Пользовательские настройки и папка `data/` сохранятся автоматически.
+
+### Чеклист перед публикацией
+
+- [ ] Репозиторий **публичный**, **не архивный** и **не форк**
+- [ ] В **Topics** добавлены `yajarvis-plugin` и тема категории (`yajarvis-...`)
+- [ ] Имя репозитория `yajarvis-<id>` совпадает с `id` в `plugin.json`
+- [ ] Создан обычный (не Draft / не Pre-release) **GitHub Release** с ассетом `jarvis-plugin.zip` или `jarvis-plugin-arm64.zip` / `jarvis-plugin-armv7.zip`
+- [ ] В `plugin.json` указана существующая иконка `icon` из списка панели и актуальная `version`
+- [ ] Для Rust: в `jarvis-plugin-armv7.zip` внутри `plugin.json` стоит `"arch": "armv7"` (не `"arm64"`)
+- [ ] Для Rust: в `tools()` используется **плоский** JSON без вложенного `"function"`, для внешних команд передаётся `PATH`, а долгие операции вынесены в `tokio::spawn`
+- [ ] Плагин проверен локально на колонке через загрузку `.zip` в панели: нет ошибок в **Журнале**, быстрая команда отвечает, а инструменты видны модели
 
 ---
 
 ## 8. Отладка и частые ошибки
 
-Смотреть логи работы плагина удобнее всего в разделе **Журнал** веб-панели (или по ADB в `/tmp/jarvisd/jarvisd.log`). Для отладки в Lua вызывайте `jarvis.log("...")` и `jarvis.status("...")`.
+Смотреть логи работы плагина удобнее всего в разделе **Журнал** веб-панели (или по ADB в `/tmp/jarvisd/jarvisd.log`). Для отладки в Lua вызывайте `jarvis.log("...")` и `jarvis.status("...")`, в Rust пишите в `stderr` (`eprintln!`).
 
-| Ошибка | Причина | Как исправить |
+| Ошибка или симптом | Причина | Как исправить |
 | :--- | :--- | :--- |
+| Плагина нет в «Неофициальные (сообщество)» | Репозиторий сделан как **форк** (на `0.10.20` и ниже форки скрыты), не добавлена тема `yajarvis-plugin`, репо приватный/архивный или сработал кеш каталога (1 час) | Создайте самостоятельный публичный репозиторий (не форк), добавьте тему `yajarvis-plugin`, нажмите обновление каталога в панели |
+| `в последнем релизе owner/repo нет jarvis-plugin-arm64.zip или jarvis-plugin.zip` | Нет опубликованного релиза (или он Draft / Pre-release), либо архив назван иначе | Опубликуйте обычный Release и прикрепите файл с точным именем `jarvis-plugin.zip` или `jarvis-plugin-arm64.zip` / `jarvis-plugin-armv7.zip` |
+| Инструменты Rust-плагина не вызываются моделью | В `Plugin::tools()` использован вложенный ключ `"function": {...}`, либо имя инструмента нарушает `[a-zA-Z0-9_-]` / пересекается с `CORE_TOOLS` | Переведите `tools()` в плоский формат `{"type": "function", "name": "...", "description": "...", "parameters": {...}}` |
+| `No such file or directory` / скрипты не находят `sh`, `iptables`, `curl` в Rust-плагине | Процесс запускается с `env_clear()` (пустой `PATH`), либо скрипт в ZIP имеет права `0644` | Вызывайте `/bin/sh` по полному пути и передавайте `.env("PATH", "/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin")` |
+| `Rust-плагин не ответил вовремя` / `Процесс Rust-пакета завершился` | Превышен таймаут RPC (`command` = 2 с, `init` = 5 с, `tool` = 15 с) или блокирующий вызов повесил цикл | Используйте `tokio::process::Command` и выносите долгую работу (установку, скачивание) в `tokio::spawn` |
 | `Это пакет для старого ядра` | В `plugin.json` указано `kind: "js"` или `"native"` | Перепишите под `kind: "lua"` или `kind: "rust"` с `api: 1` |
-| `Для Rust-пакета нужны подходящая архитектура, api: 1 и имя бинарника в корне ZIP` | Не совпадает `arch`, `api != 1`, неверный ELF или в `main` указан слэш | Соберите под нужный `musl`-таргет (`arm64` / `armv7`), положите файл в корень ZIP без пути |
+| `Для Rust-пакета нужны подходящая архитектура, api: 1 и имя бинарника в корне ZIP` / `не подходит для этой архитектуры` | В `jarvis-plugin-armv7.zip` оставили `"arch": "arm64"`, неверный ELF-таргет, `api != 1` или в `main` указан слэш | Соберите под нужный `musl`-таргет, подставьте правильный `"arch"` в `plugin.json` каждого архива, положите бинарник в корень ZIP |
+| `Rust-плагин не подтвердил запуск` | В Rust-плагине что-то выводится в `stdout` до или во время `init` | Перенесите все логи в `stderr` (`eprintln!`), не наследуйте `stdout` в дочерних процессах |
 | `домен не разрешён в network_allow` | URL-запрос в `jarvis.fetch` ушёл на домен, которого нет в `network_allow` | Добавьте точный домен (или origin / `*.domain.tld`) в `network_allow` в `plugin.json` |
 | `redirect с заголовками на другой домен` | Сработала защита от утечки `Authorization`-ключей при редиректе | Укажите конечный URL без редиректа либо не передавайте секретные заголовки при публичном GET |
 | `Lua: вызов прерван или превышено время выполнения` | Скрипт крутился > 2 с CPU или завис на HTTP > 20 с (30 с для STT/TTS) | Уменьшите `timeout_ms` у `fetch`, перенесите долгую работу в Rust-пакет |
-| `недопустимое или повторное имя инструмента` | Имя инструмента пересекается с `CORE_TOOLS` или содержит кириллицу/пробелы | Используйте уникальное имя `[a-zA-Z0-9_-]` длиной 1–64 символа |
-| `плагин не подтвердил запуск` | В Rust-плагине что-то выводится в `stdout` до или во время `init` | Перенесите все логи в `stderr` (`eprintln!`) |
+| `недопустимое или повторное имя инструмента` | Имя инструмента пересекается с `CORE_TOOLS` или содержит кириллицу/пробелы | Используйте уникальное имя `[a-zA-Z0-9_-]` длиной 1..64 символа |
+| Иконка в панели всегда «пазл» | В `plugin.json` указано имя `icon`, которого нет в наборе панели | Выберите имя из списка в разделе 4 (например `shield`, `wifi`, `cloud`, `bolt`, `home`) |
 | `мало места на колонке` | Не хватает свободного места на `/data` (требуется `размер + 3 МБ`) | Удалите неиспользуемые плагины или лишние записи в «Обучении» |

@@ -307,6 +307,8 @@ pub struct Settings {
     pub live_voices: Vec<CustomVoice>,
 
     pub wake_enabled: bool,
+    #[serde(default = "default_true")]
+    pub wake_interrupt: bool,
     pub wake_reply_enabled: bool,
     #[serde(default = "default_true")]
     pub voice_error_alice: bool,
@@ -394,6 +396,7 @@ impl Default for Settings {
             ],
             live_voices: vec![],
             wake_enabled: true,
+            wake_interrupt: true,
             wake_reply_enabled: true,
             voice_error_alice: true,
             wake_profile: String::new(),
@@ -595,6 +598,7 @@ impl Settings {
 
 struct Hot {
     wake_enabled: AtomicBool,
+    wake_interrupt: AtomicBool,
     mic_boost_db: AtomicI64,
     mic_gain_db: AtomicI64,
     wake_sensitivity: AtomicI64,
@@ -611,6 +615,7 @@ impl Hot {
     fn new(s: &Settings) -> Self {
         Self {
             wake_enabled: AtomicBool::new(s.wake_enabled),
+            wake_interrupt: AtomicBool::new(s.wake_interrupt),
             mic_boost_db: AtomicI64::new(s.mic_boost_db),
             mic_gain_db: AtomicI64::new(s.mic_gain_db),
             wake_sensitivity: AtomicI64::new(s.wake_sensitivity),
@@ -622,6 +627,7 @@ impl Hot {
 
     fn sync(&self, s: &Settings) {
         self.wake_enabled.store(s.wake_enabled, Ordering::Relaxed);
+        self.wake_interrupt.store(s.wake_interrupt, Ordering::Relaxed);
         self.mic_boost_db.store(s.mic_boost_db, Ordering::Relaxed);
         self.mic_gain_db.store(s.mic_gain_db, Ordering::Relaxed);
         self.wake_sensitivity.store(s.wake_sensitivity, Ordering::Relaxed);
@@ -674,6 +680,7 @@ impl Store {
     }
 
     pub fn wake_enabled(&self) -> bool { self.hot.wake_enabled.load(Ordering::Relaxed) }
+    pub fn wake_interrupt(&self) -> bool { self.hot.wake_interrupt.load(Ordering::Relaxed) }
     pub fn mic_boost_db(&self) -> i64 { self.hot.mic_boost_db.load(Ordering::Relaxed) }
     pub fn mic_gain_db(&self) -> i64 { self.hot.mic_gain_db.load(Ordering::Relaxed) }
     pub fn wake_sensitivity(&self) -> i64 { self.hot.wake_sensitivity.load(Ordering::Relaxed) }

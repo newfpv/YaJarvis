@@ -39,9 +39,12 @@ export function plCatalog(fresh, scope = "official") {
 
 export const plOfficialItems = () => PL.official.items || [];
 export function plInstalled(id) { return (PL.data?.installed || []).find((p) => p.id === id); }
+const sameRepo = (a, b) => Boolean(a && b) && a.toLowerCase() === b.toLowerCase();
 // plCatItem — запись каталога для установленного плагина (официальный — по id, сторонний — по репозиторию)
 export function plCatItem(p) {
-  return p.official ? plOfficial(p.id) : PL.community.items?.find((c) => c.id === p.id && c.repo === p.source);
+  return p.official
+    ? plOfficial(p.id)
+    : PL.community.items?.find((c) => sameRepo(c.repo, p.source) || (c.id === p.id && c.repo === p.source));
 }
 export function plHasUpdate(p, catalog = plCatItem(p)) {
   if (!catalog?.version || p.kind === "module") return false;
@@ -69,7 +72,7 @@ export const plRepo = () => PL.data?.repo || S.repo || "newfpv/YaJarvis";
 export function plItems() {
   const inst = PL.data?.installed || [];
   const out = [...plOfficialItems(), ...(PL.community.items || [])].map((c) => {
-    const p = inst.find((p) => p.id === c.id && (c.official ? p.official : p.source === c.repo));
+    const p = inst.find((p) => (c.official ? p.official && p.id === c.id : !p.official && sameRepo(p.source, c.repo)));
     return { ...c, name: p?.name || c.name, description: p ? plDescription(p, c) : c.description, inst: p };
   });
   for (const p of inst) {

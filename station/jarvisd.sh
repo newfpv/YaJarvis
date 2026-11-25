@@ -56,7 +56,11 @@ mic_state() {
                 return
             fi
             if grep -q 'vqe_tap\.so' "$p/maps" 2>/dev/null; then
-                state="подключён"
+                if [ -s "$RUN/mic.sock.seen" ]; then
+                    state="подключён"
+                else
+                    state="хук загружен, но звук не поступает"
+                fi
             fi
         fi
     done
@@ -76,6 +80,7 @@ stop) stop ;;
 restart) stop; sleep 1; start ;;
 status)
     echo "jarvisd: $(running "$PID" && echo работает || echo остановлен) ($("$D/jarvisd" version 2>/dev/null))"
+    [ -s "$RUN/port" ] && echo "панель: порт $(cat "$RUN/port" 2>/dev/null)"
     echo "микрофон: $(mic_state)"
     echo "автозапуск: $([ -f "$D/disabled" ] && echo выключен || echo включён)"
     ;;

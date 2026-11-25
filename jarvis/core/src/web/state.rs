@@ -235,7 +235,7 @@ pub async fn state(State(app): State<App>) -> Json<Value> {
         "update_available": app.updater.available(),
         "speaker": {"model": model.name, "model_id": model.id, "mic": app.engine.mic.online(), "mic_why": app.engine.mic.why(), "leds": app.engine.leds.available(),
                     "wake_model": app.engine.listener.ready.load(std::sync::atomic::Ordering::Relaxed), "talking": app.engine.talking(), "uptime_s": app.started.elapsed().as_secs(), "volume": tokio::task::spawn_blocking(super::vol).await.unwrap_or(-1)},
-        "settings": {"wake_enabled": s.wake_enabled, "wake_reply_enabled": s.wake_reply_enabled, "voice_error_alice": s.voice_error_alice, "wake_word": wake_word, "wake_training": wake_training, "training_records": training_records, "wake_profile": if wake_training { &s.wake_profile } else { "" }, "wake_sensitivity": s.wake_sensitivity, "mic_boost_db": s.mic_boost_db,
+        "settings": {"wake_enabled": s.wake_enabled, "wake_interrupt": s.wake_interrupt, "wake_reply_enabled": s.wake_reply_enabled, "voice_error_alice": s.voice_error_alice, "wake_word": wake_word, "wake_training": wake_training, "training_records": training_records, "wake_profile": if wake_training { &s.wake_profile } else { "" }, "wake_sensitivity": s.wake_sensitivity, "mic_boost_db": s.mic_boost_db,
                      "mic_gain_db": s.mic_gain_db, "wake_check": s.wake_check, "follow_up_s": s.follow_up_s, "city": s.city,
                      "timezone": s.timezone, "volume": s.volume, "lan_only": s.lan_only, "home_via": s.home_via,
                      "home_use": s.home_use_state(), "speaker_room": s.speaker_room, "led": s.led, "train_mode": s.train_mode,

@@ -38,6 +38,7 @@ fn patch_settings(s: &mut Settings, v: &Value) -> Result<(), std::io::Error> {
         .ok_or_else(|| invalid("Нужен объект настроек"))?;
     const ALLOWED: &[&str] = &[
         "wake_enabled",
+        "wake_interrupt",
         "wake_reply_enabled",
         "voice_error_alice",
         "wake_check",

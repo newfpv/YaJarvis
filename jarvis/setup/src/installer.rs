@@ -1137,7 +1137,8 @@ sync
 "$d/jarvisd.sh" start"#
     );
     app.shell(target, &script).await?;
-    let url = format!("http://{}:8080/", target.ip());
+    let mut port = 8080u16;
+    let mut url = format!("http://{}:{port}/", target.ip());
     if app.skip_panel_check {
         app.job.lock().unwrap().panel_check_skipped = true;
         app.log("Готово. Бэкап применён (проверка по HTTP пропущена)");
@@ -1150,6 +1151,12 @@ sync
         .build()
         .map_err(|e| e.to_string())?;
     for _ in 0..25 {
+        let detected = read_panel_port(app, target).await;
+        if detected != port {
+            port = detected;
+            url = format!("http://{}:{port}/", target.ip());
+            app.log(&format!("Порт 8080 занят на колонке, проверяю панель на порту {port}…"));
+        }
         if let Ok(response) = client.get(format!("{url}healthz")).send().await
             && response
                 .json::<Value>()
@@ -1258,7 +1265,8 @@ async fn stage_install(
     if manual_autostart {
         app.log("Скрипт для ручной настройки автозапуска сохранён в /data/opt/jarvisd/S98jarvisd");
     }
-    let url = format!("http://{}:8080/", target.ip());
+    let mut port = 8080u16;
+    let mut url = format!("http://{}:{port}/", target.ip());
     let client = if app.skip_panel_check {
         app.log("Проверяю завершение установки по ADB…");
         None
@@ -1273,6 +1281,12 @@ async fn stage_install(
         )
     };
     for _ in 0..35 {
+        let detected = read_panel_port(app, target).await;
+        if detected != port {
+            port = detected;
+            url = format!("http://{}:{port}/", target.ip());
+            app.log(&format!("Порт 8080 занят на колонке, панель открыта на порту {port}"));
+        }
         let mut mic_online = None;
         let panel_ready = match &client {
             Some(client) => match client.get(format!("{url}healthz")).send().await {
@@ -1341,6 +1355,15 @@ async fn stage_install(
         return Err("Колонка не подтвердила завершение установки по ADB".into());
     }
     Err("Панель новой сборки не ответила. Служба вернёт предыдущую версию, если она была установлена".into())
+}
+
+async fn read_panel_port(app: &Setup, target: SocketAddrV4) -> u16 {
+    app.shell(target, "cat /tmp/jarvisd/port 2>/dev/null || true")
+        .await
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .filter(|&p| p > 0)
+        .unwrap_or(8080)
 }
 
 async fn platformd_vqe_state(app: &Setup, target: SocketAddrV4) -> String {

@@ -48,9 +48,31 @@ struct St {
     pending_wake: bool,
     echo: EchoWindow,
     input_at: Option<Instant>,
+    playback_started_at: Option<Instant>,
 }
 
 const ECHO_TAIL: Duration = Duration::from_millis(450);
+const WAKE_INTERRUPT_AEC_GRACE: Duration = Duration::from_millis(550);
+const WAKE_INTERRUPT_MIN_PROB: f32 = 0.88;
+
+/// Перебивать ответ словом активации только когда колонка реально говорит, после окна сходимости VQE AEC
+/// на начале фразы и с повышенным порогом уверенности (чтобы остаточное эхо первого слова не обрывало ответ).
+fn should_wake_interrupt(
+    enabled: bool,
+    playing: bool,
+    recent_wake: bool,
+    playback_started_at: Option<Instant>,
+    wake_prob: f32,
+    now: Instant,
+) -> bool {
+    if !enabled || !playing || recent_wake {
+        return false;
+    }
+    if playback_started_at.is_some_and(|t| now.saturating_duration_since(t) < WAKE_INTERRUPT_AEC_GRACE) {
+        return false;
+    }
+    wake_prob >= WAKE_INTERRUPT_MIN_PROB
+}
 
 fn samples_to_ms(samples: u64) -> u64 {
     samples * 1000 / RATE as u64
@@ -652,9 +674,27 @@ impl Engine {
                             live.feed(&input);
                         }
                         // «Джарвис» во время разговора — как у Алисы: сразу замолкает и слушает
-                        let recent = e.st.lock().unwrap().last_wake.is_some_and(|t| t.elapsed() < Duration::from_millis(2500));
-                        if hit && !recent {
-                            e.interrupt(&live);
+                        if hit {
+                            let now = Instant::now();
+                            let (recent, playback_started_at) = {
+                                let st = e.st.lock().unwrap();
+                                (
+                                    st.last_wake.is_some_and(|t| now.saturating_duration_since(t) < Duration::from_millis(2500)),
+                                    st.playback_started_at,
+                                )
+                            };
+                            let wake_prob = det.wake_prob();
+                            if should_wake_interrupt(
+                                e.store.wake_interrupt(),
+                                e.player.playing(),
+                                recent,
+                                playback_started_at,
+                                wake_prob,
+                                now,
+                            ) {
+                                det.reset();
+                                e.interrupt(&live, wake_prob);
+                            }
                         }
                         continue;
                     }
@@ -753,6 +793,7 @@ impl Engine {
             let now = Instant::now();
             st.busy = true;
             st.echo = EchoWindow::default();
+            st.playback_started_at = None;
             st.last_wake = Some(now);
             st.aborted = false;
             st.hold.clear();
@@ -797,6 +838,7 @@ impl Engine {
                             st.hold.clear();
                             st.holding = false;
                             st.echo = EchoWindow::default();
+                            st.playback_started_at = None;
                             self.engine.reset_wake.store(true, Ordering::Relaxed);
                             self.engine.leds.set(Mode::Off);
                         }
@@ -816,6 +858,7 @@ impl Engine {
                     st.hold.clear();
                     st.holding = false;
                     st.echo = EchoWindow::default();
+                    st.playback_started_at = None;
                     q
                 };
                 e.reset_wake.store(true, Ordering::Relaxed);
@@ -1264,13 +1307,29 @@ impl Engine {
                 Err(RecvTimeoutError::Timeout) => {}
                 Ok(pcm) => {
                     if !x.dialog().muted() {
-                        if !self.player.playing() && loud(&pcm) {
+                        let is_loud = loud(&pcm);
+                        if !self.player.playing() && is_loud {
                             let _ = self.start_voice(&*x); // после перебивания плеер был остановлен
                         }
-                        if self.player.write(&pcm).is_ok() && p.engine == "gemini" {
-                            self.st.lock().unwrap().echo.played(Instant::now(), &pcm, x.rate());
+                        let wrote = self.player.write(&pcm).is_ok();
+                        if wrote {
+                            let now = Instant::now();
+                            if p.engine == "gemini" {
+                                self.st.lock().unwrap().echo.played(now, &pcm, x.rate());
+                            }
+                            if is_loud {
+                                let mut st = self.st.lock().unwrap();
+                                let onset = !speaking || st.playback_started_at.is_none();
+                                if onset {
+                                    st.playback_started_at = Some(now);
+                                    if p.is_classic() {
+                                        // Даём VQE AEC ~350 мс сойтись на старте TTS, чтобы Classic VAD не прерывал сам себя.
+                                        st.echo.played_with_tail(now, &pcm, x.rate(), Duration::from_millis(350));
+                                    }
+                                }
+                            }
                         }
-                        if loud(&pcm) {
+                        if is_loud {
                             answered = true;
                             if p.engine == "gemini" && last_voice.is_none() {
                                 log::info!("Gemini: первый голос через {:.2} с от открытия разговора", opening_at.elapsed().as_secs_f64());
@@ -1278,8 +1337,11 @@ impl Engine {
                             last_voice = Some(Instant::now());
                         }
                         self.leds.level(peak(&pcm) / 9000.0);
-                        if loud(&pcm) != speaking {
+                        if is_loud != speaking {
                             speaking = !speaking;
+                            if !speaking {
+                                self.st.lock().unwrap().playback_started_at = None;
+                            }
                             self.leds.set(if speaking { Mode::Speaking } else { Mode::Listening });
                         }
                     }
@@ -1288,7 +1350,10 @@ impl Engine {
             if x.interrupted() {
                 while out.try_recv().is_ok(){}
                 self.player.stop(true);
-                self.st.lock().unwrap().echo.stopped(Instant::now());
+                let mut st = self.st.lock().unwrap();
+                st.echo.stopped(Instant::now());
+                st.playback_started_at = None;
+                drop(st);
                 speaking = false;
                 self.leds.set(Mode::Listening);
             }
@@ -1594,11 +1659,14 @@ impl Engine {
     }
 
     /// «Джарвис» посреди ответа: замолчать сразу, слушать новую фразу.
-    fn interrupt(&self, sess: &Arc<dyn Session>) {
-        log::info!("Джарвис: перебили словом — замолкаю");
+    fn interrupt(&self, sess: &Arc<dyn Session>, prob: f32) {
+        log::info!("Джарвис: перебили словом (уверенность {prob:.2}) — замолкаю");
         sess.dialog().mute();
         self.player.stop(true);
-        self.st.lock().unwrap().echo.stopped(Instant::now());
+        let mut st = self.st.lock().unwrap();
+        st.echo.stopped(Instant::now());
+        st.playback_started_at = None;
+        drop(st);
         self.leds.set(Mode::Listening);
     }
 
@@ -2093,5 +2161,23 @@ mod tests {
         assert_eq!(j["aborted"], 1);
         assert_eq!(j["total_dropped_hold_ms"], 60);
         assert_eq!(j["last"]["aborted"], true);
+    }
+
+    #[test]
+    fn wake_interrupt_blocks_silent_onset_and_low_confidence_echo() {
+        let now = std::time::Instant::now();
+        let ms = std::time::Duration::from_millis;
+        // Выключено настройкой — никогда не перебиваем.
+        assert!(!super::should_wake_interrupt(false, true, false, Some(now - ms(1000)), 0.99, now));
+        // Плеер молчит (например, LLM ещё думает) — не глушим будущий ответ.
+        assert!(!super::should_wake_interrupt(true, false, false, None, 0.99, now));
+        // Недавнее пробуждение (<2.5 с) — игнорируем.
+        assert!(!super::should_wake_interrupt(true, true, true, Some(now - ms(1000)), 0.99, now));
+        // Первые 550 мс воспроизведения (сходимость VQE AEC на первом слове TTS) — игнорируем.
+        assert!(!super::should_wake_interrupt(true, true, false, Some(now - ms(250)), 0.99, now));
+        // Пограничная уверенность на фоне речи колонки (эхо) — игнорируем.
+        assert!(!super::should_wake_interrupt(true, true, false, Some(now - ms(800)), 0.72, now));
+        // Уверенный оклик после окна сходимости — перебиваем.
+        assert!(super::should_wake_interrupt(true, true, false, Some(now - ms(800)), 0.92, now));
     }
 }

@@ -172,9 +172,19 @@ fn topic_category(topics: &[Value]) -> &str {
         .unwrap_or("other")
 }
 
+fn community_id(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    for prefix in ["yajarvis-plugin-", "jarvis-plugin-", "yajarvis-", "jarvis-"] {
+        if let Some(rest) = lower.strip_prefix(prefix) && !rest.is_empty() {
+            return rest.to_string();
+        }
+    }
+    lower
+}
+
 async fn fetch_community() -> Result<Vec<Value>, String> {
     let query = format!(
-        "{}/search/repositories?per_page=60&sort=stars&q=topic%3A{TOPIC}",
+        "{}/search/repositories?per_page=60&sort=stars&q=topic%3A{TOPIC}+fork%3Atrue",
         github_api()
     );
     let response = crate::net::get_json(&query).await?;
@@ -187,7 +197,7 @@ async fn fetch_community() -> Result<Vec<Value>, String> {
             return None;
         }
         let name = repo["name"].as_str()?;
-        let id = name.trim_start_matches("yajarvis-").trim_start_matches("jarvis-").to_lowercase();
+        let id = community_id(name);
         let category = topic_category(repo["topics"].as_array().map(Vec::as_slice).unwrap_or(&[]));
         Some(json!({"id": id, "repo": full, "name": name, "description": repo["description"],
             "author": repo["owner"]["login"], "stars": repo["stargazers_count"],
@@ -282,5 +292,14 @@ mod tests {
             source.get(true, ready(Ok(added.clone()))).await,
             (added, String::new())
         );
+    }
+
+    #[test]
+    fn community_id_strips_yajarvis_and_plugin_prefixes() {
+        assert_eq!(community_id("yajarvis-plugin-zapret2"), "zapret2");
+        assert_eq!(community_id("jarvis-plugin-weather"), "weather");
+        assert_eq!(community_id("yajarvis-zapret"), "zapret");
+        assert_eq!(community_id("jarvis-radio"), "radio");
+        assert_eq!(community_id("MyPlugin"), "myplugin");
     }
 }

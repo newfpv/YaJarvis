@@ -246,20 +246,73 @@ async fn guard(State(app): State<App>, ConnectInfo(peer): ConnectInfo<SocketAddr
     resp
 }
 
-pub async fn serve(app: App, addr: &str) -> std::io::Result<()> {
-    let addr = if addr.starts_with(':') { format!("0.0.0.0{addr}") } else { addr.to_string() };
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+const FALLBACK_PORTS: &[u16] = &[8088, 8081, 8090];
+
+fn normalize_bind(addr: &str) -> String {
+    if addr.starts_with(':') { format!("0.0.0.0{addr}") } else { addr.to_string() }
+}
+
+async fn bind_listener(addr: &str, explicit: bool) -> std::io::Result<(tokio::net::TcpListener, u16, bool)> {
+    let primary = normalize_bind(addr);
+    match tokio::net::TcpListener::bind(&primary).await {
+        Ok(listener) => {
+            let port = listener.local_addr()?.port();
+            Ok((listener, port, false))
+        }
+        Err(err) if !explicit && err.kind() == std::io::ErrorKind::AddrInUse => {
+            let host = primary.rsplit_once(':').map(|(h, _)| h).unwrap_or("0.0.0.0");
+            for &port in FALLBACK_PORTS {
+                if let Ok(listener) = tokio::net::TcpListener::bind(format!("{host}:{port}")).await {
+                    return Ok((listener, port, true));
+                }
+            }
+            Err(err)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+pub async fn serve(app: App, addr: &str, explicit: bool) -> std::io::Result<()> {
+    let (listener, port, fallback) = bind_listener(addr, explicit).await?;
     if let Some(ready) = std::env::var_os("JARVIS_READY_PATH") {
+        let ready_path = std::path::Path::new(&ready);
+        if let Some(dir) = ready_path.parent() {
+            let _ = jarvis_station::atomic(&dir.join("port"), port.to_string().as_bytes());
+        }
         if let Ok(module) = std::env::var("JARVIS_INSTALL_MODULE") {
             app.plugins.install_module(&module).await.map_err(std::io::Error::other)?;
         }
-        jarvis_station::atomic(std::path::Path::new(&ready), format!("{} {}", std::process::id(), crate::version()).as_bytes())?;
+        jarvis_station::atomic(ready_path, format!("{} {}", std::process::id(), crate::version()).as_bytes())?;
     }
     update::automatic(app.clone());
-    log::info!("веб-настройки: http://<ip колонки>{}", &addr[addr.rfind(':').unwrap_or(0)..]);
+    if fallback {
+        log::warn!("веб-настройки: порт 8080 занят другим процессом, панель открыта на http://<ip колонки>:{port}");
+    } else {
+        log::info!("веб-настройки: http://<ip колонки>:{port}");
+    }
     axum::serve(listener, router(app).into_make_service_with_connect_info::<SocketAddr>()).await
 }
 
 pub fn empty(code: StatusCode) -> Response {
     Response::builder().status(code).body(Body::empty()).unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bind_listener_falls_back_when_primary_port_is_busy() {
+        let busy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let busy_port = busy.local_addr().unwrap().port();
+        let addr = format!("127.0.0.1:{busy_port}");
+        // Явно заданный порт не подменяется.
+        assert!(bind_listener(&addr, true).await.is_err());
+        // Автовыбор при занятом порте уходит на запасной свободный порт.
+        let (listener, bound_port, fallback) = bind_listener(&addr, false).await.unwrap();
+        assert!(fallback);
+        assert!(FALLBACK_PORTS.contains(&bound_port));
+        drop(listener);
+        drop(busy);
+    }
 }

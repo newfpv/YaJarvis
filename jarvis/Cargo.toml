@@ -5,7 +5,7 @@ default-members = ["core", "dsp"]
 exclude = ["vendor/reality-tls"]
 
 [workspace.package]
-version = "0.10.19"
+version = "0.10.20"
 edition = "2024"
 license = "MIT"
 

@@ -52,6 +52,170 @@ struct St {
 
 const ECHO_TAIL: Duration = Duration::from_millis(450);
 
+fn samples_to_ms(samples: u64) -> u64 {
+    samples * 1000 / RATE as u64
+}
+
+/// Диагностические счётчики передачи начального аудиобуфера в голосовую сессию (без PCM и текста).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct InitialAudioStats {
+    pub preroll_samples: usize,
+    pub preroll_fed_samples: usize,
+    pub hold_samples: usize,
+    pub fed_samples: usize,
+    pub dropped_preroll_samples: usize,
+    pub dropped_hold_samples: usize,
+    pub has_wake_reply: bool,
+    pub heard_input: bool,
+    pub aborted: bool,
+}
+
+impl InitialAudioStats {
+    fn to_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "preroll_samples": self.preroll_samples,
+            "preroll_ms": samples_to_ms(self.preroll_samples as u64),
+            "preroll_fed_samples": self.preroll_fed_samples,
+            "preroll_fed_ms": samples_to_ms(self.preroll_fed_samples as u64),
+            "hold_samples": self.hold_samples,
+            "hold_ms": samples_to_ms(self.hold_samples as u64),
+            "fed_samples": self.fed_samples,
+            "fed_ms": samples_to_ms(self.fed_samples as u64),
+            "dropped_preroll_samples": self.dropped_preroll_samples,
+            "dropped_preroll_ms": samples_to_ms(self.dropped_preroll_samples as u64),
+            "dropped_hold_samples": self.dropped_hold_samples,
+            "dropped_hold_ms": samples_to_ms(self.dropped_hold_samples as u64),
+            "has_wake_reply": self.has_wake_reply,
+            "heard_input": self.heard_input,
+            "aborted": self.aborted,
+        })
+    }
+}
+
+#[derive(Default)]
+struct InitialAudioDiag {
+    activations: u64,
+    with_wake_reply: u64,
+    without_wake_reply: u64,
+    aborted: u64,
+    total_hold_samples: u64,
+    total_fed_samples: u64,
+    total_dropped_preroll_samples: u64,
+    total_dropped_hold_samples: u64,
+    last: Option<InitialAudioStats>,
+}
+
+impl InitialAudioDiag {
+    fn record(&mut self, stats: InitialAudioStats) {
+        self.activations = self.activations.saturating_add(1);
+        if stats.aborted {
+            self.aborted = self.aborted.saturating_add(1);
+        } else if stats.has_wake_reply {
+            self.with_wake_reply = self.with_wake_reply.saturating_add(1);
+        } else {
+            self.without_wake_reply = self.without_wake_reply.saturating_add(1);
+        }
+        self.total_hold_samples = self.total_hold_samples.saturating_add(stats.hold_samples as u64);
+        self.total_fed_samples = self.total_fed_samples.saturating_add(stats.fed_samples as u64);
+        self.total_dropped_preroll_samples = self
+            .total_dropped_preroll_samples
+            .saturating_add(stats.dropped_preroll_samples as u64);
+        self.total_dropped_hold_samples = self
+            .total_dropped_hold_samples
+            .saturating_add(stats.dropped_hold_samples as u64);
+        self.last = Some(stats);
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "activations": self.activations,
+            "with_wake_reply": self.with_wake_reply,
+            "without_wake_reply": self.without_wake_reply,
+            "aborted": self.aborted,
+            "total_hold_ms": samples_to_ms(self.total_hold_samples),
+            "total_fed_ms": samples_to_ms(self.total_fed_samples),
+            "total_dropped_preroll_ms": samples_to_ms(self.total_dropped_preroll_samples),
+            "total_dropped_hold_ms": samples_to_ms(self.total_dropped_hold_samples),
+            "last": self.last.map(InitialAudioStats::to_json),
+        })
+    }
+}
+
+/// Атомарная передача накопленного после wake word аудио (`st.hold`) и (если нет локального отклика)
+/// хвоста `preroll` в голосовую сессию строго до публикации `st.live`.
+/// Гарантирует сохранение порядка кадров, отсутствие дублей и сохранность `st.hold` при наличии кеша.
+fn handoff_initial_audio(
+    st: &mut St,
+    engine: &str,
+    preroll: &[i16],
+    opening_at: Instant,
+    mic_boost_db: i64,
+    has_candidate_reply: bool,
+    session: &Arc<dyn Session>,
+) -> (bool, InitialAudioStats) {
+    let hold_samples = st.hold.len();
+    if st.aborted {
+        st.hold.clear();
+        st.holding = false;
+        let stats = InitialAudioStats {
+            preroll_samples: preroll.len(),
+            preroll_fed_samples: 0,
+            hold_samples,
+            fed_samples: 0,
+            dropped_preroll_samples: preroll.len(),
+            dropped_hold_samples: hold_samples,
+            has_wake_reply: false,
+            heard_input: false,
+            aborted: true,
+        };
+        return (false, stats);
+    }
+
+    let heard_input = st.input_at.is_some_and(|at| at >= opening_at);
+    let play_reply = has_candidate_reply && !heard_input;
+
+    // Если играем локальный отклик («Да?», «Слушаю.»), не пересылаем старый preroll с самим
+    // словом активации, но ВСЕ накопленные после активации кадры из st.hold обязательно отдаём модели.
+    let preroll_slice: &[i16] = if play_reply {
+        &[]
+    } else {
+        let before = match engine {
+            "chatgpt" => preroll.len().saturating_sub(RATE / 4),
+            "gemini" => preroll.len().saturating_sub(RATE * 4 / 5),
+            _ => 0,
+        };
+        &preroll[before..]
+    };
+
+    let mut first = Vec::with_capacity(preroll_slice.len() + st.hold.len());
+    first.extend_from_slice(preroll_slice);
+    first.extend_from_slice(&st.hold);
+
+    if heard_input {
+        session.dialog().heard_input(Instant::now());
+    }
+    if !first.is_empty() {
+        session.feed(&boost(&first, mic_boost_db));
+    }
+
+    let stats = InitialAudioStats {
+        preroll_samples: preroll.len(),
+        preroll_fed_samples: preroll_slice.len(),
+        hold_samples,
+        fed_samples: first.len(),
+        dropped_preroll_samples: preroll.len().saturating_sub(preroll_slice.len()),
+        dropped_hold_samples: 0,
+        has_wake_reply: play_reply,
+        heard_input,
+        aborted: false,
+    };
+
+    st.hold.clear();
+    st.holding = false;
+    st.live = Some(session.clone());
+    (play_reply, stats)
+}
+
 #[derive(Default)]
 struct EchoWindow {
     queued_until: Option<Instant>,
@@ -116,6 +280,7 @@ pub struct Engine {
     cmds: std::sync::OnceLock<crate::cmdspot::CmdSpotter>,
     last_error_notice: Mutex<Option<(String, Instant)>>,
     error_speaking: AtomicBool,
+    initial_audio: Mutex<InitialAudioDiag>,
 }
 
 fn same(a: &Arc<dyn Session>, b: &Arc<dyn Session>) -> bool {
@@ -360,7 +525,13 @@ impl Engine {
             speech_epoch: AtomicU64::new(0), speech_notify: tokio::sync::Notify::new(), saying: AtomicBool::new(false), previews: Default::default(),
             wake_replies: Default::default(), wake_reply_sequence: AtomicU64::new(0), cmds: Default::default(),
             last_error_notice: Mutex::default(), error_speaking: AtomicBool::new(false),
+            initial_audio: Mutex::default(),
         })
+    }
+
+    /// Не содержащие речи счётчики передачи начального буфера (для диагностики issue #35).
+    pub fn initial_audio_diag(&self) -> serde_json::Value {
+        self.initial_audio.lock().unwrap().to_json()
     }
 
     /// Слушать микрофон в своём потоке: слово, звук в разговор, перебивание.
@@ -574,18 +745,19 @@ impl Engine {
     /// Начать разговор (по слову, по кнопке в настройках).
     pub fn trigger(self: &Arc<Self>, source: &str, prob: f32) {
         if source == "слово" && self.recording_word.load(Ordering::Acquire) { return; }
-        let clip = {
+        let (clip, wake_at) = {
             let mut st = self.st.lock().unwrap();
             if st.busy || st.last_wake.is_some_and(|t| t.elapsed() < Duration::from_millis(1500)) {
                 return;
             }
+            let now = Instant::now();
             st.busy = true;
             st.echo = EchoWindow::default();
-            st.last_wake = Some(Instant::now());
+            st.last_wake = Some(now);
             st.aborted = false;
             st.hold.clear();
             st.holding = true;
-            st.ring.make_contiguous().to_vec()
+            (st.ring.make_contiguous().to_vec(), now)
         };
         let by_word = source == "слово";
         // как у Алисы: услышал слово — сразу кольцо и разговор; проверка имени расшифровкой — по галочке
@@ -632,7 +804,7 @@ impl Engine {
                 }
                 let mut guard = ConverseGuard { engine: &e, completed: false };
                 let preroll = if by_word { clip.clone() } else { vec![] };
-                let failure = e.converse(by_word, sure, preroll, clip);
+                let failure = e.converse(by_word, sure, preroll, clip, wake_at);
                 guard.completed = true;
                 let queued = {
                     let mut st = e.st.lock().unwrap();
@@ -909,7 +1081,14 @@ impl Engine {
 
     /// Один разговор от слова (или кнопки) до тишины.
     /// Возвращает `Some(VoiceFailure)` только при реальном сбое после всех автопереключений.
-    fn converse(self: &Arc<Self>, by_word: bool, sure: bool, preroll: Vec<i16>, clip: Vec<i16>) -> Option<crate::voice_error::VoiceFailure> {
+    fn converse(
+        self: &Arc<Self>,
+        by_word: bool,
+        sure: bool,
+        preroll: Vec<i16>,
+        clip: Vec<i16>,
+        wake_at: Instant,
+    ) -> Option<crate::voice_error::VoiceFailure> {
         let s = self.store.get();
         let p = s.active_profile();
         let provider_id = if p.is_classic() {
@@ -956,7 +1135,7 @@ impl Engine {
         let mut user_spoke = !by_word;
         let mut checked = 0i64;
         let mut checked_text = String::new();
-        let opening_at = Instant::now();
+        let opening_at = wake_at;
         let mut ready_at = Instant::now();
         let mut last_voice: Option<Instant> = None;
         let _ = (sure, &clip);
@@ -972,31 +1151,35 @@ impl Engine {
                 // Network setup is already in progress while giving a joined phrase a head start.
                 std::thread::sleep(wake_reply::FOLLOW_ON_GAP);
             }
-            let reply = {
+            let (play_reply, init_stats) = {
                 let mut st = self.st.lock().unwrap();
-                let reply = reply.filter(|_| !st.aborted && st.input_at.is_none_or(|at| at < opening_at));
-                // The wake word has already been detected. Avoid replaying seconds of
-                // old audio into the subscription call before the first real question.
-                let before = match p.engine.as_str() {
-                    "chatgpt" => preroll.len().saturating_sub(RATE / 4),
-                    "gemini" => preroll.len().saturating_sub(RATE * 4 / 5),
-                    _ => 0,
-                };
-                if reply.is_none() {
-                    let mut first = preroll[before..].to_vec();
-                    first.extend_from_slice(&st.hold);
-                    if st.input_at.is_some_and(|at| at >= opening_at) {
-                        x.dialog().heard_input(Instant::now());
-                    }
-                    x.feed(&boost(&first, s.mic_boost_db));
-                }
-                st.hold.clear();
-                st.holding = false;
-                st.live = Some(x.clone());
-                reply
+                handoff_initial_audio(
+                    &mut st,
+                    &p.engine,
+                    &preroll,
+                    opening_at,
+                    s.mic_boost_db,
+                    reply.is_some(),
+                    &x,
+                )
             };
+            self.initial_audio.lock().unwrap().record(init_stats);
+            log::debug!(
+                "начальный буфер: preroll={}ms (в feed {}ms), hold={}ms, передано={}ms, отброшено preroll={}ms hold={}ms, отклик={}, речь={}",
+                samples_to_ms(init_stats.preroll_samples as u64),
+                samples_to_ms(init_stats.preroll_fed_samples as u64),
+                samples_to_ms(init_stats.hold_samples as u64),
+                samples_to_ms(init_stats.fed_samples as u64),
+                samples_to_ms(init_stats.dropped_preroll_samples as u64),
+                samples_to_ms(init_stats.dropped_hold_samples as u64),
+                init_stats.has_wake_reply,
+                init_stats.heard_input,
+            );
             *sess = Some(x.clone());
-            if let Some(sample) = reply {
+            if init_stats.aborted {
+                return Err(None);
+            }
+            if play_reply && let Some(sample) = reply {
                 self.play_wake_reply(&sample, &p.engine, opening_at);
             }
             if self.st.lock().unwrap().aborted {
@@ -1663,5 +1846,252 @@ mod tests {
         f.expected = true;
         assert!(!engine.should_announce_failure(&f, t0 + std::time::Duration::from_secs(50)));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    struct SpySession {
+        dialog: crate::session::Dialog,
+        fed: std::sync::Mutex<Vec<Vec<i16>>>,
+        heard_before_first_feed: std::sync::Mutex<Option<bool>>,
+        opened_at: std::time::Instant,
+    }
+
+    impl SpySession {
+        fn new(opened_at: std::time::Instant) -> std::sync::Arc<Self> {
+            let journal = std::sync::Arc::new(super::Journal::default());
+            std::sync::Arc::new(Self {
+                dialog: crate::session::Dialog::new(journal, "chatgpt", "gpt-live"),
+                fed: std::sync::Mutex::default(),
+                heard_before_first_feed: std::sync::Mutex::new(None),
+                opened_at,
+            })
+        }
+
+        fn all_samples(&self) -> Vec<i16> {
+            self.fed.lock().unwrap().iter().flatten().copied().collect()
+        }
+    }
+
+    impl crate::session::Session for SpySession {
+        fn feed(&self, pcm: &[i16]) {
+            let mut flag = self.heard_before_first_feed.lock().unwrap();
+            if flag.is_none() {
+                *flag = Some(self.dialog.heard_input_since(self.opened_at));
+            }
+            self.fed.lock().unwrap().push(pcm.to_vec());
+        }
+        fn take_audio(&self) -> Option<std::sync::mpsc::Receiver<Vec<i16>>> { None }
+        fn rate(&self) -> usize { super::RATE }
+        fn ready(&self, _timeout: std::time::Duration) -> Result<(), String> { Ok(()) }
+        fn say(&self, _text: &str) -> Result<(), String> { Ok(()) }
+        fn close(&self) {}
+        fn dialog(&self) -> &crate::session::Dialog { &self.dialog }
+    }
+
+    #[test]
+    fn cached_wake_reply_preserves_hold_without_resending_wake_preroll() {
+        let opening_at = std::time::Instant::now();
+        let preroll: Vec<i16> = (0..super::RATE * 3).map(|i| (i % 97) as i16 + 1000).collect();
+        let quiet_hold: Vec<i16> = (0..1280).map(|i| (i % 50) as i16 + 20).collect();
+
+        let mut st = super::St {
+            holding: true,
+            hold: quiet_hold.clone(),
+            input_at: Some(opening_at - std::time::Duration::from_millis(20)),
+            ..Default::default()
+        };
+        let spy = SpySession::new(opening_at);
+        let sess: std::sync::Arc<dyn crate::session::Session> = spy.clone();
+
+        let (play_reply, stats) = super::handoff_initial_audio(
+            &mut st,
+            "chatgpt",
+            &preroll,
+            opening_at,
+            6,
+            true,
+            &sess,
+        );
+
+        assert!(play_reply);
+        assert!(!stats.aborted);
+        assert!(!stats.heard_input);
+        assert!(stats.has_wake_reply);
+        assert_eq!(stats.preroll_samples, preroll.len());
+        assert_eq!(stats.preroll_fed_samples, 0);
+        assert_eq!(stats.hold_samples, quiet_hold.len());
+        assert_eq!(stats.fed_samples, quiet_hold.len());
+        assert_eq!(stats.dropped_preroll_samples, preroll.len());
+        assert_eq!(stats.dropped_hold_samples, 0);
+        assert_eq!(spy.all_samples(), super::boost(&quiet_hold, 6));
+        assert!(st.hold.is_empty());
+        assert!(!st.holding);
+        assert!(st.live.is_some());
+        // Ложное wake / тихий буфер без срабатывания детектора не подменяет heard_input_since.
+        assert!(!spy.dialog.heard_input_since(opening_at));
+    }
+
+    #[test]
+    fn no_wake_reply_feeds_engine_preroll_tail_and_full_hold_in_order() {
+        let opening_at = std::time::Instant::now();
+        let preroll: Vec<i16> = (0..super::RATE * 2).map(|i| (i % 1000) as i16).collect();
+        let hold: Vec<i16> = (0..960).map(|i| 5000 + (i as i16)).collect();
+
+        for (engine, expected_preroll) in [
+            ("chatgpt", super::RATE / 4),
+            ("gemini", super::RATE * 4 / 5),
+            ("openai", preroll.len()),
+        ] {
+            let mut st = super::St {
+                holding: true,
+                hold: hold.clone(),
+                ..Default::default()
+            };
+            let spy = SpySession::new(opening_at);
+            let sess: std::sync::Arc<dyn crate::session::Session> = spy.clone();
+
+            let (play_reply, stats) = super::handoff_initial_audio(
+                &mut st,
+                engine,
+                &preroll,
+                opening_at,
+                0,
+                false,
+                &sess,
+            );
+
+            assert!(!play_reply);
+            assert_eq!(stats.preroll_fed_samples, expected_preroll);
+            assert_eq!(stats.hold_samples, hold.len());
+            assert_eq!(stats.fed_samples, expected_preroll + hold.len());
+            assert_eq!(stats.dropped_hold_samples, 0);
+            let mut expected = preroll[preroll.len() - expected_preroll..].to_vec();
+            expected.extend_from_slice(&hold);
+            assert_eq!(spy.all_samples(), expected);
+        }
+    }
+
+    #[test]
+    fn joined_phrase_during_gap_cancels_wake_reply_and_marks_input_before_feed() {
+        let opening_at = std::time::Instant::now();
+        let preroll: Vec<i16> = (0..super::RATE).map(|i| (i % 500) as i16).collect();
+        let hold: Vec<i16> = (0..1120).map(|i| 3000 + i as i16).collect();
+
+        let mut st = super::St {
+            holding: true,
+            hold: hold.clone(),
+            input_at: Some(opening_at + std::time::Duration::from_millis(15)),
+            ..Default::default()
+        };
+        let spy = SpySession::new(opening_at);
+        let sess: std::sync::Arc<dyn crate::session::Session> = spy.clone();
+
+        let (play_reply, stats) = super::handoff_initial_audio(
+            &mut st,
+            "chatgpt",
+            &preroll,
+            opening_at,
+            0,
+            true,
+            &sess,
+        );
+
+        assert!(!play_reply, "слитная фраза сразу после слова должна отменять кешированный отклик");
+        assert!(stats.heard_input);
+        assert!(!stats.has_wake_reply);
+        assert_eq!(*spy.heard_before_first_feed.lock().unwrap(), Some(true));
+        assert_eq!(stats.preroll_fed_samples, super::RATE / 4);
+        assert_eq!(stats.dropped_hold_samples, 0);
+        let mut expected = preroll[preroll.len() - super::RATE / 4..].to_vec();
+        expected.extend_from_slice(&hold);
+        assert_eq!(spy.all_samples(), expected);
+    }
+
+    #[test]
+    fn speech_over_wake_reply_and_slow_connect_keeps_exact_stream_without_gaps_or_duplicates() {
+        let opening_at = std::time::Instant::now();
+        let frames: Vec<Vec<i16>> = (0..5)
+            .map(|f| (0..320).map(|i| (f * 1000 + i) as i16).collect())
+            .collect();
+        let preroll = vec![77i16; super::RATE];
+
+        let mut st = super::St {
+            holding: true,
+            ..Default::default()
+        };
+        // Первые 2 кадра пришли до handoff (во время FOLLOW_ON_GAP) -> копятся в st.hold.
+        for frame in &frames[..2] {
+            if st.holding && st.live.is_none() {
+                st.hold.extend_from_slice(frame);
+            }
+        }
+
+        let spy = SpySession::new(opening_at);
+        let sess: std::sync::Arc<dyn crate::session::Session> = spy.clone();
+        let (play_reply, stats) = super::handoff_initial_audio(
+            &mut st,
+            "chatgpt",
+            &preroll,
+            opening_at,
+            0,
+            true,
+            &sess,
+        );
+        assert!(play_reply);
+        assert_eq!(stats.hold_samples, 640);
+        assert_eq!(stats.fed_samples, 640);
+        assert_eq!(stats.dropped_hold_samples, 0);
+
+        // Оставшиеся 3 кадра пришли поверх кешированного отклика и медленного подключения -> сразу в st.live.
+        for frame in &frames[2..] {
+            assert!(!st.holding);
+            st.live.as_ref().unwrap().feed(frame);
+        }
+
+        let expected: Vec<i16> = frames.into_iter().flatten().collect();
+        assert_eq!(spy.all_samples(), expected);
+    }
+
+    #[test]
+    fn aborted_handoff_drops_cleanly_without_feeding_or_publishing_live_session() {
+        let opening_at = std::time::Instant::now();
+        let preroll = vec![10i16; 8000];
+        let hold = vec![20i16; 960];
+
+        let mut st = super::St {
+            holding: true,
+            hold: hold.clone(),
+            aborted: true,
+            ..Default::default()
+        };
+        let spy = SpySession::new(opening_at);
+        let sess: std::sync::Arc<dyn crate::session::Session> = spy.clone();
+
+        let (play_reply, stats) = super::handoff_initial_audio(
+            &mut st,
+            "chatgpt",
+            &preroll,
+            opening_at,
+            0,
+            true,
+            &sess,
+        );
+
+        assert!(!play_reply);
+        assert!(stats.aborted);
+        assert_eq!(stats.fed_samples, 0);
+        assert_eq!(stats.dropped_hold_samples, hold.len());
+        assert_eq!(stats.dropped_preroll_samples, preroll.len());
+        assert!(spy.all_samples().is_empty());
+        assert!(st.live.is_none());
+        assert!(st.hold.is_empty());
+        assert!(!st.holding);
+
+        let mut diag = super::InitialAudioDiag::default();
+        diag.record(stats);
+        let j = diag.to_json();
+        assert_eq!(j["activations"], 1);
+        assert_eq!(j["aborted"], 1);
+        assert_eq!(j["total_dropped_hold_ms"], 60);
+        assert_eq!(j["last"]["aborted"], true);
     }
 }

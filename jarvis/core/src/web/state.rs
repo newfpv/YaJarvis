@@ -242,6 +242,7 @@ pub async fn state(State(app): State<App>) -> Json<Value> {
                      "language": s.language, "night": night, "night_now": s.is_night(), "radio": !s.radio_off,
                      "onboarded": s.onboarded, "plugins_warned": s.plugins_warned},
         "wake_replies": app.engine.wake_reply_status(),
+        "initial_audio": app.engine.initial_audio_diag(),
         "plugins": app.plugins.summary(),
         "providers": app.plugins.service_providers(),
         "text_plugins": app.plugins.text_plugins(),

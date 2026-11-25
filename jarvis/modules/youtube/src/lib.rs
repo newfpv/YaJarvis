@@ -637,6 +637,8 @@ impl Youtube {
                         }
                         if repeat_source.client == "ANDROID_VR" {
                             force_tv = true;
+                        } else if last.contains("(403") {
+                            self.remote.invalidate_player_cache();
                         }
                         keep_playing = true;
                         pending.push_front(track.clone());
@@ -1133,6 +1135,7 @@ impl Youtube {
             "account_begin" => self.account.begin(&self.remote).await,
             "account_logout" => {
                 self.account.logout().await?;
+                let _ = self.account.clear_cookies();
                 self.library_cache.lock().await.clear();
                 Ok(Value::Null)
             }

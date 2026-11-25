@@ -68,7 +68,7 @@ export function connDefs() {
       "«Включи/выключи …» выполняется сразу по домашней сети, за доли секунды"),
     homeProvider("xiaomi", "Mi", "Xiaomi Home", "Лампы, розетки, пылесосы и другие устройства из приложения Mi Home",
       "Джарвис управляет ими голосом: «включи лампу в спальне», «запусти пылесос»"),
-    { id: "youtube", group: "media", plugin: "youtube", mono: "YT", name: "YouTube", about: "Музыка и видео голосом. Вход — для ваших рекомендаций и видео 18+",
+    { id: "youtube", group: "media", plugin: "youtube", mono: "YT", name: "YouTube", about: "Музыка и видео голосом. Вход откроет ваши рекомендации, лайки, плейлисты и больше возможностей",
       more: "Там, где YouTube заблокирован (Россия), включите «Через VPN»",
       on: Boolean(account.signed_in || youtube.set), wait: !account.signed_in && Boolean(account.code),
       state: account.signed_in ? (ytLabel || "вход выполнен") : youtube.set ? (ytLabel ? `${ytLabel} · куки` : "куки загружены") : account.code ? "ждёт код" : "не подключено" },

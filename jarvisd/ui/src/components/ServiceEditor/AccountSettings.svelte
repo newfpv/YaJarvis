@@ -53,7 +53,7 @@
       {@html icon("done")}
       <span>
         Колонка вошла в YouTube{#if ytName} · <b>{ytName}</b>{:else if youtube.name} · <b>{youtube.name}</b>{/if}
-        <small>{[ytIdentity, "видео 18+ и медиатека доступны"].filter(Boolean).join(" · ")}</small>
+        <small>{[ytIdentity, "ваши рекомендации, лайки, плейлисты и больше возможностей"].filter(Boolean).join(" · ")}</small>
       </span>
     </div>
   {:else}

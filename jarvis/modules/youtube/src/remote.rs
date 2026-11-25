@@ -119,11 +119,15 @@ pub struct Remote {
 }
 impl Remote {
     pub fn new(host: Arc<Host>) -> Self {
+        let scripts = Scripts::with_cache(host.data.join("player-cache.json.gz"));
         Self {
             host,
-            scripts: Default::default(),
+            scripts,
             visitor: Default::default(),
         }
+    }
+    pub fn invalidate_player_cache(&self) {
+        self.scripts.invalidate();
     }
     pub async fn warm(&self) -> Result<(), String> {
         self.scripts
@@ -231,9 +235,17 @@ impl Remote {
             return Ok(AccountProfile::default());
         }
         let mut profile = AccountProfile::default();
-        for endpoint in ["account/account_menu", "account/accounts_list"] {
-            if let Ok(data) = self.post_client(endpoint, json!({}), headers.clone()).await {
-                profile.merge_missing(parse_account_profile(&data));
+        for (endpoint, body) in [
+            ("account/account_menu", json!({})),
+            (
+                "account/accounts_list",
+                json!({"accountReadMask": {"returnOwner": true, "returnBrandAccounts": true}}),
+            ),
+            ("account/accounts_list", json!({})),
+        ] {
+            match self.post_client(endpoint, body, headers.clone()).await {
+                Ok(data) => profile.merge_missing(parse_account_profile(&data)),
+                Err(error) => log::debug!("YouTube: {endpoint} не вернул профиль: {error}"),
             }
             if !profile.name.is_empty() && (!profile.handle.is_empty() || !profile.email.is_empty())
             {
@@ -573,7 +585,7 @@ impl Remote {
             String::new()
         };
         let mut backup = None;
-        if !prefer_tv && auth.is_empty() && !self.scripts.cached() {
+        if !prefer_tv && auth.is_empty() && !self.scripts.has_warm_cache() {
             self.scripts.warm_background(client.clone());
             match vr(&client, id, &visitor).await {
                 Ok(value) => return Ok(value),
@@ -1024,14 +1036,39 @@ pub(crate) fn parse_account_profile(value: &Value) -> AccountProfile {
                         email: text_label(&hdr["email"]),
                     });
                 }
-                if let Some(item) = map.get("accountItemRenderer") {
-                    let byline = text_label(&item["accountByline"]);
-                    let (handle, email) = if byline.starts_with('@') {
-                        (byline, String::new())
-                    } else if byline.contains('@') {
-                        (String::new(), byline)
+                if let Some(hdr) = map.get("googleAccountHeaderRenderer") {
+                    let name = text_label(&hdr["name"]);
+                    let name = if name.is_empty() {
+                        text_label(&hdr["accountName"])
                     } else {
-                        (String::new(), String::new())
+                        name
+                    };
+                    header.merge_missing(AccountProfile {
+                        name,
+                        handle: text_label(&hdr["channelHandle"]),
+                        email: text_label(&hdr["email"]),
+                    });
+                }
+                if let Some(item) = map
+                    .get("accountItemRenderer")
+                    .or_else(|| map.get("accountItem"))
+                {
+                    let byline = text_label(&item["accountByline"]);
+                    let explicit_handle = text_label(&item["channelHandle"]);
+                    let explicit_email = text_label(&item["email"]);
+                    let handle = if !explicit_handle.is_empty() {
+                        explicit_handle
+                    } else if byline.starts_with('@') {
+                        byline.clone()
+                    } else {
+                        String::new()
+                    };
+                    let email = if !explicit_email.is_empty() {
+                        explicit_email
+                    } else if byline.contains('@') && !byline.starts_with('@') {
+                        byline
+                    } else {
+                        String::new()
                     };
                     let mut candidate = AccountProfile {
                         name: text_label(&item["accountName"]),
@@ -1044,6 +1081,15 @@ pub(crate) fn parse_account_profile(value: &Value) -> AccountProfile {
                     } else {
                         fallback_item.merge_missing(candidate);
                     }
+                }
+                if let Some(ch) = map.get("accountChannelRenderer") {
+                    let mut candidate = AccountProfile {
+                        name: text_label(&ch["title"]),
+                        handle: text_label(&ch["channelHandle"]),
+                        email: text_label(&ch["email"]),
+                    };
+                    candidate.normalize();
+                    fallback_item.merge_missing(candidate);
                 }
                 for child in map.values() {
                     walk(child, depth + 1, header, selected_item, fallback_item);
@@ -1064,7 +1110,7 @@ pub(crate) fn parse_account_profile(value: &Value) -> AccountProfile {
         &mut fallback_item,
     );
     header.merge_missing(selected_item);
-    if header.name.is_empty() {
+    if header.name.is_empty() || (header.handle.is_empty() && header.email.is_empty()) {
         header.merge_missing(fallback_item);
     }
     header.normalize();
@@ -1706,6 +1752,38 @@ mod tests {
                 name: "Основной канал".into(),
                 handle: String::new(),
                 email: "main@example.com".into(),
+            }
+        );
+
+        let tv_accounts = json!({
+            "contents": [{
+                "accountSectionListRenderer": {
+                    "contents": [{
+                        "accountItemSectionRenderer": {
+                            "header": {
+                                "googleAccountHeaderRenderer": {
+                                    "name": {"simpleText": "Alex"},
+                                    "email": {"simpleText": "alex@gmail.com"}
+                                }
+                            },
+                            "contents": [{
+                                "accountItem": {
+                                    "accountName": {"runs": [{"text": "Alex TV"}]},
+                                    "accountByline": {"runs": [{"text": "@alextv"}]},
+                                    "isSelected": true
+                                }
+                            }]
+                        }
+                    }]
+                }
+            }]
+        });
+        assert_eq!(
+            parse_account_profile(&tv_accounts),
+            AccountProfile {
+                name: "Alex".into(),
+                handle: "@alextv".into(),
+                email: "alex@gmail.com".into(),
             }
         );
     }

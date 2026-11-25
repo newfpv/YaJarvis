@@ -1,17 +1,34 @@
 //! YouTube player script, evaluated without filesystem, process or network bindings.
-use jarvis_home_common::bytes;
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
+use jarvis_home_common::{bytes, save};
 use regex_lite::Regex;
 use reqwest::Client;
 use rquickjs::{CatchResultExt, Context, Function, Object, Runtime};
+use serde::{Deserialize, Serialize};
 use std::{
+    fs,
+    io::{Read, Write},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 const EJS: &str = include_str!("ejs.js");
 const WEB_AGENT: &str = super::remote::WEB_AGENT;
-const MAX_HEAP: usize = 36 << 20;
+const MAX_PARSE_HEAP: usize = 36 << 20;
+const MAX_SOLVER_HEAP: usize = 16 << 20;
+const MAX_CACHE_BYTES: usize = 2 << 20;
+const MAX_CACHE_UNPACKED: usize = 6 << 20;
 const JS_TIMEOUT: Duration = Duration::from_secs(180);
+const SOLVER_LOAD_TIMEOUT: Duration = Duration::from_secs(15);
+const DISK_VERIFY_TTL: Duration = Duration::from_secs(6 * 3600);
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CachedPlayer {
+    id: String,
+    timestamp: u32,
+    chunks: Vec<String>,
+}
 
 pub struct Prepared {
     context: Context,
@@ -20,7 +37,7 @@ pub struct Prepared {
     pub timestamp: u32,
 }
 impl Prepared {
-    pub(crate) fn new(source: String) -> Result<Self, String> {
+    fn extract_chunks(source: String) -> Result<(u32, Vec<String>), String> {
         let timestamp = Regex::new(r"signatureTimestamp\s*[=:]\s*(\d+)")
             .unwrap()
             .captures(&source)
@@ -41,8 +58,10 @@ impl Prepared {
             .get(head.get(0).unwrap().end()..end)
             .ok_or("Неверный формат плеера YouTube")?;
         let cuts = boundaries(body.as_bytes());
+        // Run the heavy meriyah AST parser in a temporary Runtime and drop it immediately
+        // so EJS (~15 MB) never stays resident in the solver Context.
         let runtime = Runtime::new().map_err(|_| "Не запустить движок плеера YouTube")?;
-        runtime.set_memory_limit(MAX_HEAP);
+        runtime.set_memory_limit(MAX_PARSE_HEAP);
         runtime.set_max_stack_size(6 << 20);
         let deadline = Arc::new(Mutex::new(Instant::now() + JS_TIMEOUT));
         let cutoff = deadline.clone();
@@ -92,16 +111,36 @@ impl Prepared {
                     .map_err(|e| format!("prepare retained functions: {e}"))
             })
             .map_err(|e| format!("Не разобрать текущий плеер YouTube: {e}"))?;
-        runtime.run_gc();
-        for (index, chunk) in chunks.into_iter().enumerate() {
+        Ok((timestamp, chunks))
+    }
+
+    pub(crate) fn from_chunks(timestamp: u32, chunks: &[String]) -> Result<Self, String> {
+        let runtime = Runtime::new().map_err(|_| "Не запустить движок плеера YouTube")?;
+        runtime.set_memory_limit(MAX_SOLVER_HEAP);
+        runtime.set_max_stack_size(2 << 20);
+        let deadline = Arc::new(Mutex::new(Instant::now() + SOLVER_LOAD_TIMEOUT));
+        let cutoff = deadline.clone();
+        runtime.set_interrupt_handler(Some(Box::new(move || {
+            Instant::now() >= *cutoff.lock().unwrap()
+        })));
+        let context = Context::full(&runtime).map_err(|_| "Не создать окружение плеера YouTube")?;
+        for (index, chunk) in chunks.iter().enumerate() {
             context
                 .with(|ctx| {
-                    ctx.eval::<(), _>(chunk)
+                    ctx.eval::<(), _>(chunk.as_str())
                         .catch(&ctx)
                         .map_err(|e| e.to_string())
                 })
                 .map_err(|e| format!("Не запустить плеер YouTube, фрагмент {index}: {e}"))?;
         }
+        context
+            .with(|ctx| {
+                ctx.globals()
+                    .get::<_, Function>("__solve")
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            })
+            .map_err(|e| format!("В кэше плеера нет __solve: {e}"))?;
         runtime.set_max_stack_size(512 << 10);
         runtime.run_gc();
         Ok(Self {
@@ -110,6 +149,12 @@ impl Prepared {
             deadline,
             timestamp,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new(source: String) -> Result<Self, String> {
+        let (timestamp, chunks) = Self::extract_chunks(source)?;
+        Self::from_chunks(timestamp, &chunks)
     }
     pub async fn decode(
         self: &Arc<Self>,
@@ -145,6 +190,7 @@ impl Prepared {
 pub struct Scripts(Arc<Mutex<ScriptCache>>);
 #[derive(Default)]
 struct ScriptCache {
+    cache_path: Option<PathBuf>,
     current: Option<(Instant, Instant, String, Arc<Prepared>)>,
     failed: Option<(Instant, String)>,
     inflight: Option<tokio::sync::watch::Receiver<Option<Result<Arc<Prepared>, String>>>>,
@@ -159,7 +205,102 @@ enum ScriptLoad {
     Reused(Arc<Prepared>),
     Compiled(String, Arc<Prepared>),
 }
+
+fn read_disk_cache(path: &Path) -> Option<CachedPlayer> {
+    let meta = fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_CACHE_BYTES as u64 {
+        return None;
+    }
+    let raw = fs::read(path).ok()?;
+    let bytes = if raw.starts_with(b"\x1f\x8b") {
+        let mut out = Vec::new();
+        GzDecoder::new(raw.as_slice())
+            .take((MAX_CACHE_UNPACKED + 1) as u64)
+            .read_to_end(&mut out)
+            .ok()?;
+        if out.len() > MAX_CACHE_UNPACKED {
+            return None;
+        }
+        out
+    } else {
+        raw
+    };
+    let cached: CachedPlayer = serde_json::from_slice(&bytes).ok()?;
+    if cached.id.is_empty() || cached.chunks.is_empty() {
+        return None;
+    }
+    Some(cached)
+}
+
+fn disk_cache_fresh(path: &Path) -> bool {
+    fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|mtime| mtime.elapsed().ok())
+        .is_some_and(|age| age < DISK_VERIFY_TTL)
+}
+
+fn write_disk_cache(path: &Path, entry: &CachedPlayer) {
+    let Ok(json) = serde_json::to_vec(entry) else {
+        return;
+    };
+    if json.len() > MAX_CACHE_UNPACKED {
+        log::warn!("YouTube: кэш плеера слишком большой ({} КБ)", json.len() >> 10);
+        return;
+    }
+    let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
+    if enc.write_all(&json).is_err() {
+        return;
+    }
+    let Ok(compressed) = enc.finish() else {
+        return;
+    };
+    if compressed.len() > MAX_CACHE_BYTES {
+        log::warn!(
+            "YouTube: сжатый кэш плеера слишком большой ({} КБ)",
+            compressed.len() >> 10
+        );
+        return;
+    }
+    match save(path, &compressed) {
+        Ok(()) => log::info!(
+            "YouTube: кэш плеера {} сохранён ({} КБ)",
+            entry.id,
+            compressed.len() >> 10
+        ),
+        Err(error) => log::warn!("YouTube: не сохранить кэш плеера: {error}"),
+    }
+}
+
+fn spawn_from_chunks(
+    timestamp: u32,
+    chunks: Vec<String>,
+) -> tokio::sync::oneshot::Receiver<Result<Prepared, String>> {
+    let (send, result) = tokio::sync::oneshot::channel();
+    if std::thread::Builder::new()
+        .name("youtube-script-cache".into())
+        .stack_size(3 << 20)
+        .spawn(move || {
+            let _ = send.send(Prepared::from_chunks(timestamp, &chunks));
+        })
+        .is_err()
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = tx.send(Err("Не запустить движок плеера".into()));
+        return rx;
+    }
+    result
+}
+
 impl Scripts {
+    pub fn with_cache(path: PathBuf) -> Self {
+        Self(Arc::new(Mutex::new(ScriptCache {
+            cache_path: Some(path),
+            ..ScriptCache::default()
+        })))
+    }
+
+    #[cfg(test)]
     pub fn cached(&self) -> bool {
         self.0
             .lock()
@@ -168,6 +309,35 @@ impl Scripts {
             .as_ref()
             .is_some_and(|(at, _, _, _)| at.elapsed() < Duration::from_secs(1800))
     }
+
+    pub fn has_warm_cache(&self) -> bool {
+        let state = self.0.lock().unwrap();
+        if state
+            .current
+            .as_ref()
+            .is_some_and(|(at, _, _, _)| at.elapsed() < Duration::from_secs(1800))
+        {
+            return true;
+        }
+        state.cache_path.as_deref().is_some_and(|path| {
+            fs::metadata(path)
+                .ok()
+                .is_some_and(|m| m.is_file() && m.len() > 0 && m.len() <= MAX_CACHE_BYTES as u64)
+        })
+    }
+
+    pub fn invalidate(&self) {
+        let path = {
+            let mut state = self.0.lock().unwrap();
+            state.current.take();
+            state.failed.take();
+            state.cache_path.clone()
+        };
+        if let Some(path) = path {
+            let _ = fs::remove_file(path);
+        }
+    }
+
     pub async fn evict_if_idle(&self, idle: Duration) {
         let mut state = self.0.lock().unwrap();
         if state.inflight.is_none()
@@ -264,20 +434,70 @@ impl Scripts {
         {
             return;
         }
+        let cache_path = state.cache_path.clone();
         let _ = self.spawn_load(&mut state, move |shared| async move {
-            load_script(&client, &shared).await
+            load_script(&client, &shared, cache_path, true).await
         });
     }
     pub async fn get(&self, client: &Client) -> Result<Arc<Prepared>, String> {
-        let client = client.clone();
-        self.load_or_wait(move |shared| async move { load_script(&client, &shared).await })
-            .await
+        let (client, cache_path) = {
+            let state = self.0.lock().unwrap();
+            (client.clone(), state.cache_path.clone())
+        };
+        let scripts = self.clone();
+        let refresh_client = client.clone();
+        let check_path = cache_path.clone();
+        let prepared = self
+            .load_or_wait(move |shared| async move {
+                load_script(&client, &shared, cache_path, false).await
+            })
+            .await?;
+        // If we served immediately from an older disk cache, verify iframe_api in background.
+        if let Some(path) = check_path
+            && !disk_cache_fresh(&path)
+        {
+            let mut state = scripts.0.lock().unwrap();
+            if state.inflight.is_none() {
+                let _ = scripts.spawn_load(&mut state, move |shared| async move {
+                    load_script(&refresh_client, &shared, Some(path), true).await
+                });
+            }
+        }
+        Ok(prepared)
     }
 }
 async fn load_script(
     client: &Client,
     shared: &Arc<Mutex<ScriptCache>>,
+    cache_path: Option<PathBuf>,
+    verify_remote: bool,
 ) -> Result<ScriptLoad, (bool, String)> {
+    // Fast path for live playback: if a valid disk cache exists and we don't need
+    // to force a remote check, restore the tiny solver chunks in ~0.2s with zero network wait.
+    if !verify_remote
+        && let Some(path) = cache_path.as_deref()
+        && let Some(cached) = read_disk_cache(path)
+    {
+        let started = Instant::now();
+        match spawn_from_chunks(cached.timestamp, cached.chunks)
+            .await
+            .map_err(|_| "Движок плеера завершился".to_owned())
+            .and_then(|r| r)
+        {
+            Ok(prepared) => {
+                log::info!(
+                    "YouTube: плеер {} загружен из кэша за {:.2} с",
+                    cached.id,
+                    started.elapsed().as_secs_f64()
+                );
+                return Ok(ScriptLoad::Compiled(cached.id, Arc::new(prepared)));
+            }
+            Err(error) => {
+                log::debug!("YouTube: кэш плеера повреждён ({error}), пересобираю");
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
     let iframe = fetch(client, "https://www.youtube.com/iframe_api", WEB_AGENT, 1 << 20)
         .await
         .map_err(|e| (false, e))?;
@@ -294,9 +514,41 @@ async fn load_script(
             let now = Instant::now();
             *at = now;
             *used = now;
+            if let Some(path) = cache_path.as_deref()
+                && let Ok(file) = fs::OpenOptions::new().write(true).open(path)
+            {
+                let _ = file.set_modified(std::time::SystemTime::now());
+            }
             return Ok(ScriptLoad::Reused(prepared.clone()));
         }
         state.current.take();
+    }
+    // Check if disk cache already holds this exact player ID (e.g. after reboot or idle eviction).
+    if let Some(path) = cache_path.as_deref()
+        && let Some(cached) = read_disk_cache(path)
+        && cached.id == id
+    {
+        let started = Instant::now();
+        match spawn_from_chunks(cached.timestamp, cached.chunks)
+            .await
+            .map_err(|_| "Движок плеера завершился".to_owned())
+            .and_then(|r| r)
+        {
+            Ok(prepared) => {
+                if let Ok(file) = fs::OpenOptions::new().write(true).open(path) {
+                    let _ = file.set_modified(std::time::SystemTime::now());
+                }
+                log::info!(
+                    "YouTube: плеер {id} загружен из кэша за {:.2} с",
+                    started.elapsed().as_secs_f64()
+                );
+                return Ok(ScriptLoad::Compiled(id, Arc::new(prepared)));
+            }
+            Err(error) => {
+                log::debug!("YouTube: кэш плеера {id} повреждён ({error}), пересобираю");
+                let _ = fs::remove_file(path);
+            }
+        }
     }
     let tv_url = format!("https://www.youtube.com/s/player/{id}/tv-player-ias.vflset/tv-player-ias.js");
     let source = match fetch(client, &tv_url, super::remote::TV_AGENT, 8 << 20).await {
@@ -314,15 +566,19 @@ async fn load_script(
         .name("youtube-script".into())
         .stack_size(8 << 20)
         .spawn(move || {
-            let _ = send.send(Prepared::new(source));
+            let parsed = Prepared::extract_chunks(source).and_then(|(ts, chunks)| {
+                let prepared = Prepared::from_chunks(ts, &chunks)?;
+                Ok((ts, chunks, prepared))
+            });
+            let _ = send.send(parsed);
         })
         .map_err(|_| (false, "Не запустить движок плеера".to_owned()))?;
-    let prepared = match result
+    let (timestamp, chunks, prepared) = match result
         .await
         .map_err(|_| "Движок плеера завершился".to_owned())
         .and_then(|result| result)
     {
-        Ok(prepared) => Arc::new(prepared),
+        Ok((ts, chunks, prepared)) => (ts, chunks, Arc::new(prepared)),
         Err(error) => {
             log::debug!("YouTube: {error}");
             #[cfg(test)]
@@ -330,6 +586,16 @@ async fn load_script(
             return Err((true, "Не разобрать текущий плеер YouTube".to_owned()));
         }
     };
+    if let Some(path) = cache_path.as_deref() {
+        write_disk_cache(
+            path,
+            &CachedPlayer {
+                id: id.clone(),
+                timestamp,
+                chunks,
+            },
+        );
+    }
     log::info!(
         "YouTube: плеер {id} готов за {:.2} с",
         started.elapsed().as_secs_f64()
@@ -523,5 +789,45 @@ mod tests {
         let cached = spawn_call(scripts.clone(), calls.clone(), entered, release).await.unwrap().unwrap();
         assert_eq!(cached.timestamp, 12345);
         assert_eq!(calls.load(Ordering::SeqCst), calls_before);
+    }
+
+    #[tokio::test]
+    async fn disk_cache_reloads_solver_without_reparsing_or_network() {
+        let dir = std::env::temp_dir().join(format!("jarvis-yt-cache-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cache_file = dir.join("player-cache.json");
+
+        let (ts, chunks) = Prepared::extract_chunks(FIXTURE.to_owned()).unwrap();
+        assert_eq!(ts, 12345);
+        write_disk_cache(
+            &cache_file,
+            &CachedPlayer {
+                id: "abcd1234".into(),
+                timestamp: ts,
+                chunks,
+            },
+        );
+
+        let scripts = Scripts::with_cache(cache_file.clone());
+        assert!(!scripts.cached());
+        assert!(scripts.has_warm_cache());
+
+        // Fast path loads straight from disk cache with a dummy client (no network).
+        let client = Client::builder().no_proxy().build().unwrap();
+        let loaded = scripts.get(&client).await.unwrap();
+        assert_eq!(loaded.timestamp, 12345);
+        assert_eq!(
+            loaded.decode("abc".into(), "xyz".into()).await.unwrap(),
+            ("cba".into(), "zyx".into())
+        );
+        assert!(scripts.cached());
+
+        // Invalidate removes both RAM and disk cache.
+        scripts.invalidate();
+        assert!(!scripts.cached());
+        assert!(!scripts.has_warm_cache());
+        assert!(!cache_file.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

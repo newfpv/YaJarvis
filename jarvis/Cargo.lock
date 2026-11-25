@@ -1530,6 +1530,7 @@ name = "jarvis-youtube"
 version = "0.10.21"
 dependencies = [
  "base64 0.22.1",
+ "flate2",
  "hex",
  "jarvis-home-common",
  "jiff",

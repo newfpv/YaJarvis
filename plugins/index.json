@@ -84,7 +84,7 @@
       "kind": "rust",
       "category": "media",
       "name": "YouTube",
-      "version": "1.1.1",
+      "version": "1.1.2",
       "icon": "music",
       "description": "Поиск и воспроизведение YouTube, очередь, история, лайки, плейлисты и вход в аккаунт.",
       "min_core": "0.10.0"

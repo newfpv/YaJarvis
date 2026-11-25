@@ -13,6 +13,8 @@ mod training;
 mod training_background;
 #[cfg(feature = "training")]
 mod training_records;
+#[cfg(feature = "training")]
+mod training_yadisk;
 
 type Callback = Arc<
     dyn Fn(String, Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result> + Send>>

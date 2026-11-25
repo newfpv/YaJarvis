@@ -1,11 +1,17 @@
 <script module>
   const backgroundUrl = "/api/train/background";
   const cloudUrl = backgroundUrl + "/cloud";
+
+  function formatSpace(mb) {
+    if (!Number.isFinite(mb) || mb <= 0) return "";
+    if (mb >= 1024) return `${(mb / 1024).toFixed(1)} ГБ`;
+    return `${Math.round(mb)} МБ`;
+  }
 </script>
 
 <script>
   import { onMount } from "svelte";
-  import { api, toast } from "#helpers/core.js";
+  import { api, icon, toast } from "#helpers/core.js";
   import styles from "./BackgroundRecording.module.css";
 
   let { onconnection } = $props();
@@ -16,13 +22,24 @@
   let pending = $state(false);
   let reading = $state(false);
   let error = $state("");
-  let provider = $state("nextcloud");
-  let link = $state("");
-  let email = $state("");
-  let password = $state("");
   let minutes = $state(60);
   let timer;
   let revision = 0;
+
+  let account = $derived(result?.account || null);
+  let login = $derived(result?.login || null);
+  let accountTitle = $derived(account?.name || account?.login || "Яндекс Диск");
+  let accountMeta = $derived.by(() => {
+    if (!account) return "";
+    const parts = [];
+    if (account.login && account.login !== accountTitle) parts.push(account.login);
+    const free = formatSpace(account.free_mb);
+    const total = formatSpace(account.total_mb);
+    if (free && total) parts.push(`свободно ${free} из ${total}`);
+    else if (free) parts.push(`свободно ${free}`);
+    parts.push("папка Приложения / YaJarvis");
+    return parts.join(" · ");
+  });
 
   let status = $derived.by(() => {
     if (!result) return "";
@@ -45,12 +62,14 @@
   function update(next) {
     result = next;
     error = "";
-    onconnection(Boolean(next.provider));
+    onconnection(Boolean(next.connected));
   }
 
   function scheduleRefresh() {
     clearTimeout(timer);
-    if (!signal.aborted && result?.running) timer = setTimeout(refresh, 2500);
+    if (!signal.aborted && (result?.running || result?.login?.code)) {
+      timer = setTimeout(refresh, 2500);
+    }
   }
 
   async function refresh() {
@@ -89,37 +108,53 @@
     }
   }
 
-  async function connect(event) {
-    event.preventDefault();
-    const input = provider === "koofr" ? { provider, email, password } : { provider, link, password };
-    if (await change("PUT", cloudUrl, input)) {
-      password = "";
-      link = "";
-    }
+  function connect() {
+    void change("PUT", cloudUrl, {});
+  }
+
+  function disconnect() {
+    if (result?.connected && !confirm("Отключить Яндекс Диск? Уже загруженные записи на Диске останутся.")) return;
+    void change("DELETE", cloudUrl);
   }
 
   function start(event) {
     event.preventDefault();
     void change("POST", backgroundUrl, { minutes });
   }
+
+  async function copyCode(code) {
+    if (!code) return;
+    try {
+      await navigator.clipboard.writeText(code);
+      toast("Код скопирован");
+    } catch {
+      toast("Выделите код вручную", true);
+    }
+  }
 </script>
 
 <section class="sec">
   <div class="sec-h">
-    <h2>Длительная запись фона</h2>
-    <p>Колонка сама отправляет сжатые записи в облако. Каждая порция занимает примерно минуту и хранится в памяти до отправки.</p>
+    <h2>Яндекс Диск и запись фона</h2>
+    <p>Колонка выгружает короткие записи и длительный фон в отдельную папку «Приложения / YaJarvis» на вашем Яндекс Диске.</p>
   </div>
   <div class="sec-b">
-    {#if result?.provider}
-      <form class={styles.form} onsubmit={start}>
+    {#if result?.connected}
+      <div class="cn-ok">
+        {@html icon("done")}
+        <span>
+          Яндекс Диск подключён · <b>{accountTitle}</b>
+          {#if accountMeta}<small>{accountMeta}</small>{/if}
+        </span>
+      </div>
+      {#if !result.running}
         <div class="row">
-          <span class="st ok">{result.provider === "koofr" ? "Koofr подключён" : "Nextcloud подключён"}</span>
-          {#if !result.running}
-            <button type="button" class="btn ghost" disabled={pending} onclick={() => change("DELETE", cloudUrl)}>Отключить</button>
-          {/if}
+          <button type="button" class="btn ghost" disabled={pending} onclick={disconnect}>Выйти</button>
         </div>
+      {/if}
+      <form class={styles.form} onsubmit={start}>
         <div class="f">
-          <label for="bg-length">Продолжительность</label>
+          <label for="bg-length">Длительная запись фона (минутные порции без записи во флешку)</label>
           <select id="bg-length" bind:value={minutes} disabled={pending || result.running}>
             <option value={15}>15 минут</option>
             <option value={60}>1 час</option>
@@ -135,38 +170,28 @@
           {/if}
         </div>
       </form>
+    {:else if login?.code}
+      <div class="ycode">
+        <span>Откройте <a href={login.url || "https://ya.ru/device"} target="_blank" rel="noopener noreferrer">{(login.url || "https://ya.ru/device").replace("https://", "")}</a> и введите код</span>
+        <b class="code-big" role="button" tabindex="0" title="Нажмите, чтобы скопировать"
+          onclick={() => copyCode(login.code)}
+          onkeydown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              void copyCode(login.code);
+            }
+          }}>{login.code}</b>
+        <small class="muted">окно само увидит подключение</small>
+      </div>
+      <div class="row">
+        <button type="button" class="btn ghost" disabled={pending} onclick={disconnect}>Отмена</button>
+      </div>
     {:else if result}
-      <form class={styles.form} onsubmit={connect}>
-        <div class="f">
-          <label for="bg-provider">Облако</label>
-          <select id="bg-provider" bind:value={provider} disabled={pending} onchange={() => { password = ""; }}>
-            <option value="nextcloud">Nextcloud</option>
-            <option value="koofr">Koofr</option>
-          </select>
-        </div>
-        {#if provider === "koofr"}
-          <div class="f">
-            <label for="bg-email">Почта Koofr</label>
-            <input id="bg-email" type="email" bind:value={email} required autocomplete="off" disabled={pending}>
-          </div>
-        {:else}
-          <div class="f">
-            <label for="bg-link">Ссылка Nextcloud на папку «Только загрузка»</label>
-            <input id="bg-link" type="url" bind:value={link} required placeholder="https://cloud.example.com/s/…" autocomplete="off" disabled={pending}>
-          </div>
-        {/if}
-        <div class="f">
-          <label for="bg-password">{provider === "koofr" ? "Пароль приложения Koofr" : "Пароль ссылки, если задан"}</label>
-          <input id="bg-password" type="password" bind:value={password} required={provider === "koofr"}
-            maxlength="512" autocomplete="off" disabled={pending}>
-        </div>
-        {#if provider === "koofr"}
-          <small class="muted">В <a href="https://app.koofr.net" target="_blank" rel="noopener noreferrer">Koofr</a> откройте настройки пароля и создайте отдельный пароль приложения.</small>
-        {:else}
-          <small class="muted">В Nextcloud откройте «Поделиться» у папки, выберите «Только загрузка» и скопируйте ссылку.</small>
-        {/if}
-        <div><button type="submit" class="btn primary" disabled={pending}>Подключить облако</button></div>
-      </form>
+      {#if login?.error}<p class="note err" role="status">{login.error}</p>{/if}
+      <div class="row">
+        <button type="button" class="btn primary" disabled={pending} onclick={connect}>Подключить Яндекс Диск</button>
+      </div>
+      <p class="note">Вход по коду в Яндекс ID. Колонка видит только свою папку «Приложения / YaJarvis» и не получает доступа к остальным файлам на Диске.</p>
     {:else if !error}
       <p class="note" role="status">Проверяю подключение…</p>
     {/if}

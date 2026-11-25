@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use std::{io, time::Duration};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-const ARCHIVE_TIMEOUT: Duration = Duration::from_secs(300);
+const ARCHIVE_TIMEOUT: Duration = Duration::from_secs(600);
 
 pub fn routes() -> axum::Router<App> {
     use axum::routing::{get, post, put};
@@ -48,9 +48,23 @@ fn result(result: Result<Value, String>) -> Response {
     }
 }
 
-async fn list(State(app): State<App>) -> Response {
+#[derive(Deserialize, Default)]
+struct ListQuery {
+    #[serde(default)]
+    refresh: Option<u8>,
+}
+
+async fn list(State(app): State<App>, Query(q): Query<ListQuery>) -> Response {
     let (mode, limit) = app.store.with(|s| (s.train_mode, s.train_limit_mb));
-    result(request(&app, "training.records", json!({"mode":mode,"limit":limit})).await)
+    let refresh = q.refresh.unwrap_or(0) != 0;
+    result(
+        request(
+            &app,
+            "training.records",
+            json!({"mode": mode, "limit": limit, "refresh": refresh}),
+        )
+        .await,
+    )
 }
 
 async fn compact(State(app): State<App>) -> Response {
@@ -325,7 +339,8 @@ async fn stop_background(State(app): State<App>) -> Response {
     result(request(&app, "training.background.stop", Value::Null).await)
 }
 
-async fn connect(State(app): State<App>, Json(input): Json<Value>) -> Response {
+async fn connect(State(app): State<App>, body: Option<Json<Value>>) -> Response {
+    let input = body.map(|Json(v)| v).unwrap_or(Value::Null);
     result(request(&app, "training.background.connect", input).await)
 }
 

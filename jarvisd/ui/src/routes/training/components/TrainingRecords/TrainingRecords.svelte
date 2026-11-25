@@ -64,9 +64,10 @@
     return () => prefetch.abort();
   });
 
-  async function refresh() {
+  async function refresh(force = false) {
     try {
-      data = await api("GET", recordsUrl, undefined, { signal });
+      const url = force ? recordsUrl + "?refresh=1" : recordsUrl;
+      data = await api("GET", url, undefined, { signal });
       error = "";
       if (selectedKey && !data.clips?.some((clip) => clipKey(clip) === selectedKey)) {
         audio.pause();
@@ -77,6 +78,12 @@
     } catch (failure) {
       if (!signal.aborted) error = failure.message;
     }
+  }
+
+  function handleConnection(value) {
+    const changed = connected !== null && connected !== value;
+    connected = value;
+    if (changed) void run(() => refresh(true));
   }
 
   async function run(action) {
@@ -145,11 +152,14 @@
   }
 
   function clearRecords() {
-    if (busy || !confirm("Удалить все записи для обучения? Сначала лучше скачать архив.")) return;
+    const prompt = hasCloud
+      ? "Удалить все записи с колонки и из папки YaJarvis на Яндекс Диске? Сначала лучше скачать архив."
+      : "Удалить все записи для обучения? Сначала лучше скачать архив.";
+    if (busy || !confirm(prompt)) return;
     void run(async () => {
       await api("DELETE", recordsUrl, undefined, { signal });
       toast("Записи удалены");
-      await refresh();
+      await refresh(true);
     });
   }
 
@@ -194,17 +204,18 @@
       {/if}
       <p class="note">
         {hasCloud
-          ? "Когда лимит заполнен, 10 самых старых непроверенных записей отправляются в подключённое облако одним ZIP."
-          : "Подключите облако ниже, чтобы старые записи при заполнении лимита уходили туда пачками по 10."}
-        {offload.running ? " Отправляю…" : ""}
-        {offload.sent ? ` Отправлено записей: ${offload.sent}.` : ""}
+          ? "Новые записи автоматически выгружаются на Яндекс Диск и освобождают память колонки. Прослушивание, разметка и скачивание архива работают прямо оттуда."
+          : "Подключите Яндекс Диск ниже одной кнопкой, чтобы записи сразу уходили в облако и не упирались в память колонки."}
+        {hasCloud && data.remote ? ` На Диске: ${data.remote}.` : ""}
+        {offload.running ? " Выгружаю…" : ""}
+        {offload.sent ? ` Выгружено за сеанс: ${offload.sent}.` : ""}
       </p>
-      {#if hasCloud && offload.error}<p class="note err">{offload.error}. Записи остались на колонке.</p>{/if}
+      {#if hasCloud && offload.error}<p class="note err">{offload.error}. Новые записи пока сохраняются на колонке.</p>{/if}
       {#if data.legacy_kb}<p class="note">Старый архив занимает {(data.legacy_kb / 1024).toFixed(1)} МБ.</p>{/if}
     </div>
   </section>
 
-  <BackgroundRecording onconnection={(value) => { connected = value; }} />
+  <BackgroundRecording onconnection={handleConnection} />
 
   <section class="sec">
     <div class="sec-h">
@@ -273,6 +284,9 @@
           {/each}
         </div>
         <span class="spacer"></span>
+        {#if hasCloud}
+          <button class="btn sm ghost" type="button" disabled={busy} onclick={() => run(() => refresh(true))}>Обновить</button>
+        {/if}
         {#if clips.length}
           <button class="btn sm ghost danger" type="button" disabled={busy} onclick={clearRecords}>Удалить все</button>
         {/if}
@@ -287,8 +301,8 @@
               <b>
                 {clipWhen(clip)}
                 {#if clip.remote}
-                  <span class="on-cloud" title="На Google Диске — колонка докачает при прослушивании"
-                    aria-label="На Google Диске" role="img">{@html icon("cloud")}</span>
+                  <span class="on-cloud" title="На Яндекс Диске — колонка докачает при прослушивании"
+                    aria-label="На Яндекс Диске" role="img">{@html icon("cloud")}</span>
                 {/if}
               </b>
               <small>{clipSec(clip).toFixed(1)} с{clipProb(clip) ? ` · ${clipProb(clip)}%` : ""}{clip.reviewed ? " · проверено" : ""}</small>

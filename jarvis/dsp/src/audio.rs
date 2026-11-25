@@ -1,5 +1,7 @@
 //! Обработка звука для динамика: подъём частоты до 48 кГц, ограничитель громкости, мягкий потолок.
 
+use std::collections::VecDeque;
+
 /// Частота, которую плеер всегда отдаёт в ALSA.
 pub const OUT_RATE: usize = 48000;
 
@@ -117,32 +119,77 @@ pub fn gain_pcm(pcm: &mut [i16], db: i64) {
     }
 }
 
-/// Ограничитель с опережением на 5 мс: громкие слоги заранее плавно прижимаются к потолку, тихие — полностью.
+/// Ограничитель с опережением на 5 мс и удержанием пика по всему окну задержки:
+/// громкие слоги заранее и плавно прижимаются к потолку без клиппинга и без срыва на переходах через ноль.
 pub struct Limiter {
     buf: Vec<f32>,
     pos: usize,
+    seq: u64,
+    peaks: VecDeque<(u64, f32)>,
     gain: f32,
+    attack: f32,
+    release: f32,
 }
 
 impl Limiter {
     pub fn new(rate: usize) -> Self {
-        Limiter { buf: vec![0.0; (rate / 200).max(16)], pos: 0, gain: 1.0 }
+        let rate = rate.max(8_000);
+        let len = (rate / 200).max(16);
+        let attack = 1.0 - (-1.0 / (0.001 * rate as f32)).exp();
+        let release = 1.0 - (-1.0 / (0.120 * rate as f32)).exp();
+        Limiter {
+            buf: vec![0.0; len],
+            pos: 0,
+            seq: 0,
+            peaks: VecDeque::with_capacity(len + 1),
+            gain: 1.0,
+            attack,
+            release,
+        }
     }
 
     #[inline]
     pub fn next_f32(&mut self, x: f32) -> i16 {
         const CEIL: f32 = 29000.0;
         let a = x.abs();
-        let t = if a > CEIL { CEIL / a } else { 1.0 };
-        if t < self.gain {
-            self.gain += (t - self.gain) * 0.1;
-        } else {
-            self.gain += (t - self.gain) / (0.12 * 200.0 * self.buf.len() as f32);
+        let idx = self.seq;
+        self.seq = self.seq.wrapping_add(1);
+        let window = self.buf.len() as u64;
+        while let Some(&(old, _)) = self.peaks.front() {
+            if idx.wrapping_sub(old) >= window {
+                self.peaks.pop_front();
+            } else {
+                break;
+            }
         }
-        let y = self.buf[self.pos] * self.gain;
+        while let Some(&(_, val)) = self.peaks.back() {
+            if val <= a {
+                self.peaks.pop_back();
+            } else {
+                break;
+            }
+        }
+        self.peaks.push_back((idx, a));
+
+        let delayed = self.buf[self.pos];
         self.buf[self.pos] = x;
-        self.pos = (self.pos + 1) % self.buf.len();
-        soft_clip_f32(y)
+        self.pos += 1;
+        if self.pos == self.buf.len() {
+            self.pos = 0;
+        }
+
+        let window_peak = self.peaks.front().map_or(a, |&(_, v)| v).max(delayed.abs());
+        let target = if window_peak > CEIL { CEIL / window_peak } else { 1.0 };
+        if target < self.gain {
+            self.gain += (target - self.gain) * self.attack;
+        } else {
+            self.gain += (target - self.gain) * self.release;
+        }
+        let delayed_abs = delayed.abs();
+        if delayed_abs * self.gain > CEIL {
+            self.gain = CEIL / delayed_abs;
+        }
+        soft_clip_f32(delayed * self.gain)
     }
 
     pub fn next(&mut self, x: f64) -> i16 {
@@ -189,5 +236,22 @@ mod tests {
         let out: Vec<i16> = (0..4000).map(|i| l.next(if i % 2 == 0 { 60000.0 } else { -60000.0 })).collect();
         assert!(out[200..].iter().all(|v| v.unsigned_abs() <= 32767));
         assert_eq!(soft_clip(1000.0), 1000);
+    }
+
+    #[test]
+    fn limiter_holds_gain_across_zero_crossings_without_hard_clipping() {
+        let mut l = Limiter::new(48000);
+        // Сигнал 440 Гц с пиком 150 000 (имитация сильного усиления тихого голоса)
+        let out: Vec<i16> = (0..4800)
+            .map(|i| {
+                let s = (i as f64 * std::f64::consts::TAU * 440.0 / 48000.0).sin() * 150_000.0;
+                l.next_f32(s as f32)
+            })
+            .collect();
+        // После 5 мс задержки (240 сэмплов) ни один пик не должен упираться в клиппинг > 29100
+        let steady = &out[480..];
+        let max_abs = steady.iter().map(|v| v.unsigned_abs()).max().unwrap();
+        assert!(max_abs <= 29100, "unexpected clipping peak: {max_abs}");
+        assert!(max_abs >= 27000, "limiter over-attenuated signal: {max_abs}");
     }
 }

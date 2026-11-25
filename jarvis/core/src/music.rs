@@ -749,7 +749,7 @@ pub fn volume_loop(music: Arc<Music>, host: Arc<Host>, duck: impl Fn() -> bool +
                     return;
                 }
             }
-            let v = if duck() { 0.16 } else { 0.8 };
+            let v = if duck() { 0.18 } else { 0.95 };
             if v != last
                 && let Ok(n) = host.provider("youtube")
                 && n.notify("volume", json!({"v": v})).await.is_ok()

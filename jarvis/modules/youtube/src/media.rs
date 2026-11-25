@@ -15,6 +15,10 @@ const FIRST_CHUNK: u64 = 64 << 10;
 const CHUNK: u64 = 256 << 10;
 const PREFETCH_CHUNKS: usize = 4;
 const CLUSTER: u32 = 0x1f43b675;
+const SAMPLE_RATE: usize = 48_000;
+const CHANNELS: usize = 2;
+const MAX_FRAME_SAMPLES: usize = 5760;
+const BYTES_PER_SEC: f64 = (SAMPLE_RATE * CHANNELS * 2) as f64;
 
 struct Input {
     rx: tokio::sync::mpsc::Receiver<io::Result<Vec<u8>>>,
@@ -321,20 +325,21 @@ unsafe impl Send for Decoder {}
 impl Decoder {
     fn new() -> io::Result<Self> {
         let mut error = 0;
-        let pointer = unsafe { opus::opus_decoder_create(48000, 1, &mut error) };
+        let pointer = unsafe { opus::opus_decoder_create(SAMPLE_RATE as i32, CHANNELS as i32, &mut error) };
         NonNull::new(pointer)
             .map(Self)
             .ok_or_else(|| io::Error::other(format!("Opus: {error}")))
     }
 
     fn decode(&mut self, packet: &[u8], pcm: &mut [i16]) -> io::Result<usize> {
+        let frame_size = (pcm.len() / CHANNELS) as i32;
         let count = unsafe {
             opus::opus_decode(
                 self.0.as_ptr(),
                 packet.as_ptr(),
                 packet.len() as i32,
                 pcm.as_mut_ptr(),
-                pcm.len() as i32,
+                frame_size,
                 0,
             )
         };
@@ -395,7 +400,7 @@ pub async fn play(
         .ok_or_else(|| invalid("YouTube не вернул кадры Opus"))?;
     let child = tokio::process::Command::new("aplay")
         .args([
-            "-q", "-D", "default", "-t", "raw", "-f", "S16_LE", "-r", "48000", "-c", "1",
+            "-q", "-D", "default", "-t", "raw", "-f", "S16_LE", "-r", "48000", "-c", "2",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -411,7 +416,7 @@ pub async fn play(
     let lead = Duration::from_millis(350);
     let mut next_write = Instant::now();
     write_audio(&mut stdin, data).await?;
-    next_write += Duration::from_secs_f64(data.len() as f64 / 96_000.0);
+    next_write += Duration::from_secs_f64(data.len() as f64 / BYTES_PER_SEC);
     progress(start);
     while let Some((timestamp, data)) = audio.next(volume()).await? {
         // ALSA may accept a long buffer immediately. Keep the producer close to real time
@@ -421,7 +426,7 @@ pub async fn play(
         }
         write_audio(&mut stdin, data).await?;
         next_write =
-            next_write.max(Instant::now()) + Duration::from_secs_f64(data.len() as f64 / 96_000.0);
+            next_write.max(Instant::now()) + Duration::from_secs_f64(data.len() as f64 / BYTES_PER_SEC);
         progress((timestamp - lead.as_secs_f64()).max(start));
     }
     drop(stdin);
@@ -441,9 +446,9 @@ pub struct Audio {
     first: Option<(usize, i64)>,
     start: f64,
     gain: f32,
-    packet: [u8; 8192],
-    pcm: [i16; 5760],
-    out: [u8; 11520],
+    packet: Vec<u8>,
+    pcm: Vec<i16>,
+    out: Vec<u8>,
 }
 impl Audio {
     pub async fn open(client: Client, stream: Stream, start: f64, gain: f32) -> io::Result<Self> {
@@ -459,7 +464,7 @@ impl Audio {
             input: Input::new(client.clone(), stream.clone(), offset),
             cluster_ms: 0,
         };
-        let mut packet = [0; 8192];
+        let mut packet = vec![0; 8192];
         let mut first = None;
         if offset > 0 {
             if webm.sync().await.is_ok()
@@ -481,8 +486,8 @@ impl Audio {
             start,
             gain,
             packet,
-            pcm: [0; 5760],
-            out: [0; 11520],
+            pcm: vec![0; MAX_FRAME_SAMPLES * CHANNELS],
+            out: vec![0; MAX_FRAME_SAMPLES * CHANNELS * 2],
         })
     }
 
@@ -508,10 +513,12 @@ impl Audio {
             } else {
                 self.gain + (target - self.gain) * 0.1
             };
-            for (sample, bytes) in self.pcm[..count].iter().zip(self.out.chunks_exact_mut(2)) {
-                bytes.copy_from_slice(&((*sample as f32 * self.gain) as i16).to_le_bytes());
+            let samples = count * CHANNELS;
+            for (sample, bytes) in self.pcm[..samples].iter().zip(self.out.chunks_exact_mut(2)) {
+                let scaled = (*sample as f32 * self.gain).round().clamp(-32767.0, 32767.0) as i16;
+                bytes.copy_from_slice(&scaled.to_le_bytes());
             }
-            return Ok(Some((sec, &self.out[..count * 2])));
+            return Ok(Some((sec, &self.out[..samples * 2])));
         }
     }
 }
@@ -585,6 +592,7 @@ mod tests {
             duration: 30.0,
             ready: Instant::now(),
             itag: 251,
+            bitrate: 160_000,
         };
         let client = Client::builder().no_proxy().build().unwrap();
         let mut input = Input::new(client.clone(), stream.clone(), 0);
@@ -648,6 +656,7 @@ mod tests {
             duration: 10.0,
             ready: Instant::now(),
             itag: 251,
+            bitrate: 160_000,
         };
         let client = Client::builder()
             .no_proxy()

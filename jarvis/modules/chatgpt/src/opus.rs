@@ -20,6 +20,7 @@ impl Encoder {
         let settings = [
             (opus::OPUS_SET_BITRATE_REQUEST, bitrate),
             (opus::OPUS_SET_COMPLEXITY_REQUEST, 10),
+            (opus::OPUS_SET_SIGNAL_REQUEST, opus::OPUS_SIGNAL_VOICE as i32),
             (opus::OPUS_SET_MAX_BANDWIDTH_REQUEST, opus::OPUS_BANDWIDTH_WIDEBAND as i32),
             (opus::OPUS_SET_INBAND_FEC_REQUEST, 1),
             (opus::OPUS_SET_PACKET_LOSS_PERC_REQUEST, 10),

@@ -55,7 +55,7 @@ impl StandbyPeer{
         let runtime=Arc::new(RoutedRuntime::new_standby(&network)?);
         let tcp_only=runtime.proxied() && !runtime.udp();
         let mut media=MediaEngine::default();
-        let codec=RTCRtpCodec{mime_type:"audio/opus".into(),clock_rate:48000,channels:2,sdp_fmtp_line:"minptime=10;useinbandfec=1".into(),rtcp_feedback:vec![]};
+        let codec=RTCRtpCodec{mime_type:"audio/opus".into(),clock_rate:48000,channels:2,sdp_fmtp_line:"minptime=10;useinbandfec=1;maxplaybackrate=48000;maxaveragebitrate=128000".into(),rtcp_feedback:vec![]};
         media.register_codec(RTCRtpCodecParameters{rtp_codec:codec.clone(),payload_type:AUDIO_PAYLOAD,..Default::default()},RtpCodecKind::Audio).map_err(|e|e.to_string())?;
         let registry=register_default_interceptors(rtc::interceptor::Registry::new(),&mut media).map_err(|e|e.to_string())?;
         let mut setting=SettingEngineBuilder::new()

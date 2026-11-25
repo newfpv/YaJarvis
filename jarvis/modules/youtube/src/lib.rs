@@ -154,7 +154,7 @@ impl Youtube {
             save_lock: Arc::new(AsyncMutex::default()),
             wake: Notify::new(),
             closed: AtomicBool::new(false),
-            gain: AtomicU32::new(0.8f32.to_bits()),
+            gain: AtomicU32::new(0.95f32.to_bits()),
         }
     }
 
@@ -565,7 +565,12 @@ impl Youtube {
                     && state.queue.len() < 20
                     && state.related.is_empty()
             };
-            log::debug!("YouTube: аудио {} Opus {}", source.client, source.itag);
+            log::info!(
+                "YouTube: аудио {} Opus itag={} {} кбит/с 48 кГц стерео",
+                source.client,
+                source.itag,
+                source.bitrate / 1000
+            );
             let repeat_source = source.clone();
             let mut sent = false;
             // The audio task owns aplay. Dropping it on pause or stop closes the pipe and kills the child.
@@ -1653,6 +1658,7 @@ mod tests {
                 duration: 120.0,
                 ready: Instant::now(),
                 itag: 251,
+                bitrate: 160_000,
             });
             st.related.push_back(Track {
                 id: "jNQXAC9IVRw".into(),

@@ -111,6 +111,7 @@ pub struct Stream {
     pub duration: f64,
     pub ready: Instant,
     pub itag: u64,
+    pub bitrate: u64,
 }
 pub struct Remote {
     host: Arc<Host>,
@@ -1341,16 +1342,21 @@ async fn formats(
         .into_iter()
         .flatten()
         .filter(|item| {
-            matches!(item["itag"].as_u64(), Some(249..=251))
+            matches!(item["itag"].as_u64(), Some(249..=251 | 774))
                 && item["mimeType"]
                     .as_str()
                     .is_some_and(|m| m.starts_with("audio/webm"))
         })
         .collect();
     candidates.sort_by_key(|v| {
+        let rate = v["averageBitrate"]
+            .as_u64()
+            .or_else(|| v["bitrate"].as_u64())
+            .unwrap_or(0);
         std::cmp::Reverse((
             v["audioTrack"]["audioIsDefault"] != false,
             v["isDrc"] != true,
+            rate,
             v["itag"].as_u64(),
         ))
     });
@@ -1367,6 +1373,10 @@ async fn formats(
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or_default() as f64
             / 1000.0;
+        let bitrate = item["averageBitrate"]
+            .as_u64()
+            .or_else(|| item["bitrate"].as_u64())
+            .unwrap_or(0);
         return Ok((
             track,
             Stream {
@@ -1377,6 +1387,7 @@ async fn formats(
                 duration,
                 ready,
                 itag: item["itag"].as_u64().unwrap(),
+                bitrate,
             },
         ));
     }

@@ -1,0 +1,28 @@
+name: Предложение / идея (Feature Request)
+description: Новая функция, поддержка устройства или улучшение YaJarvis
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Что хочется добавить или улучшить?
+      description: Коротко опишите задачу и сценарий использования на колонке.
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: Модель колонки (если важно для фичи)
+      placeholder: "Например: Станция Мини 2 / все модели"
+    validations:
+      required: false
+
+  - type: textarea
+    id: details
+    attributes:
+      label: Как вы видите реализацию или поведение?
+      description: Примеры голосовых команд, настройки в веб-панели, детали API и т.п.
+    validations:
+      required: false

@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Частые вопросы и бесплатный старт (FAQ)
+    url: https://github.com/newfpv/YaJarvis/blob/main/docs/FAQ.md
+    about: Настройка бесплатных ключей Gemini / ElevenLabs, VPN, сброс пароля и удаление
+  - name: Вики по плагинам и инструкция для ИИ-агентов
+    url: https://github.com/newfpv/YaJarvis/blob/main/docs/PLUGINS.md
+    about: Установка плагинов и спецификация PLUGIN-AGENT.md

@@ -1,0 +1,77 @@
+name: Сообщить об ошибке (Bug Report)
+description: Отчёт о сбое, вылете или некорректной работе YaJarvis на колонке
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Перед созданием тикета проверьте **[FAQ](https://github.com/newfpv/YaJarvis/blob/main/docs/FAQ.md)** и **[список открытых Issues](https://github.com/newfpv/YaJarvis/issues)**.
+        Никогда не прикладывайте файлы `settings.json`, `seed.json`, API-ключи и ссылки `vless://`!
+
+  - type: dropdown
+    id: model
+    attributes:
+      label: Модель колонки
+      options:
+        - Станция Лайт
+        - Станция Лайт 2
+        - Станция Мини
+        - Станция Мини 2
+        - Станция Мини 3
+        - Станция Мини 3 Про
+        - Станция Миди / Cucumber
+        - Станция 2
+        - Станция 3
+        - Станция Стрит
+        - Другая (укажите ниже)
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Версия YaJarvis
+      description: Посмотреть можно в веб-панели или отчёте диагностики.
+      placeholder: "0.10.23"
+    validations:
+      required: true
+
+  - type: input
+    id: engine
+    attributes:
+      label: Голосовой движок / режим / плагин
+      placeholder: "Gemini Live / ChatGPT / ElevenLabs / VPN / YouTube / ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Описание проблемы и шаги воспроизведения
+      description: Что именно происходит, как воспроизвести и что ожидалось.
+      placeholder: |
+        1. Говорю «Джарвис, ...»
+        2. Кольцо загорается / ответ не воспроизводится / ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Диагностический отчёт или логи (без секретов!)
+      description: |
+        В веб-панели колонки откройте **Логи → «Отчёт для баг-репорта»** и вставьте содержимое скачанного файла сюда (или прикрепите `.txt` файл). В нём уже вырезаны ключи и токены.
+      render: text
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Проверка перед отправкой
+      options:
+        - label: Я проверил FAQ и открытые Issues — такой проблемы ещё нет (или у меня новая воспроизводимая деталь)
+          required: true
+        - label: Я убедился, что в тексте и логах нет API-ключей, `settings.json`, паролей, куков и ссылок `vless://`
+          required: true

@@ -12,6 +12,7 @@
   import { api, copyText, icon, toast } from "#helpers/core.js";
   import { parseLogLine } from "#helpers/logs.js";
   import { getPanel } from "#state/panelContext.js";
+  import { showGate } from "#state/panelState.js";
   import styles from "./Logs.module.css";
 
   let source = $state(preferences.source);
@@ -20,8 +21,10 @@
   let lines = $state.raw([]);
   let entries = $derived(lines.map(parseLogLine));
   let emptyText = $state("Загружаю…");
+  let downloading = $state(false);
   let logbox = $state();
   let request;
+  let reportController;
   let searchTimer;
   const { onPoll } = getPanel();
 
@@ -32,6 +35,7 @@
       unsubscribe();
       clearTimeout(searchTimer);
       request?.abort();
+      reportController?.abort();
     };
   });
 
@@ -98,6 +102,50 @@
       toast("Не получилось скопировать", true);
     }
   }
+
+  function filenameFrom(response) {
+    const header = response.headers.get("Content-Disposition") || "";
+    const match = header.match(/filename="?([^";\s]+)"?/i);
+    if (match?.[1]) return match[1];
+    return `yajarvis-diag-${new Date().toISOString().slice(0, 10)}.txt`;
+  }
+
+  async function downloadReport() {
+    if (downloading) return;
+    downloading = true;
+    const controller = new AbortController();
+    reportController = controller;
+    try {
+      const response = await fetch("/api/logs/report", {
+        credentials: "same-origin",
+        signal: controller.signal,
+      });
+      if (response.status === 401 || response.status === 428) {
+        const d = await response.json().catch(() => ({}));
+        showGate(d.setup);
+        throw new Error(d.error || "Нужно войти");
+      }
+      if (!response.ok) {
+        const d = await response.json().catch(() => ({}));
+        throw new Error(d.error || `Ошибка ${response.status}`);
+      }
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filenameFrom(response);
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      toast("Отчёт диагностики скачан");
+    } catch (error) {
+      if (!controller.signal.aborted) toast(error.message, true);
+    } finally {
+      if (reportController === controller) reportController = undefined;
+      downloading = false;
+    }
+  }
 </script>
 
 <header class="ph ph-row">
@@ -128,6 +176,7 @@
       Обновлять сами
     </label>
     <button class="btn sm" type="button" onclick={copyLogs}>{@html icon("link")}Скопировать</button>
+    <button class="btn sm" type="button" disabled={downloading} onclick={downloadReport}>{@html icon("download")}{downloading ? "Собираю…" : "Отчёт для баг-репорта"}</button>
   </div>
   <div class={styles.logbox} bind:this={logbox}>
     {#each entries as { time, message, level }}

@@ -123,6 +123,7 @@ pub fn router(app: App) -> Router {
         .route("/api/update/upload", put(update::upload).layer(DefaultBodyLimit::max(jarvis_station::MAX_BINARY as usize)))
         .route("/api/stats", get(diagnostics::stats))
         .route("/api/logs", get(diagnostics::logs))
+        .route("/api/logs/report", get(diagnostics::report))
         .route("/api/leds/preview", post(device::leds))
         .route("/api/preview", post(talk::preview))
         .route("/api/preview/status", get(talk::preview_status))

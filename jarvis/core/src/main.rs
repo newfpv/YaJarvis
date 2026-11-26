@@ -7,6 +7,8 @@ mod alice_music;
 mod launchpatch;
 mod audio;
 mod chatgpt;
+mod chatgpt_accounts;
+mod live_stats;
 mod buttons;
 mod speakervol;
 mod cmdspot;

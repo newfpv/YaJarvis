@@ -49,21 +49,56 @@ fn yt_auth(s: &crate::settings::Settings) -> Value {
 impl CoreServices {
     pub fn call(&self, id: &str, method: &str, params: &Value) -> Result<Value, String> {
         let official = (self.official)(id);
+        if id == "chatgpt" && method=="voice.stats" {
+            if !official{return Err("official plugin required".into())}
+            self.store.update(|s|->Result<(),std::io::Error>{
+                let a=s.chatgpt_accounts.iter_mut().find(|a|Some(a.id.as_str())==params["id"].as_str()).ok_or_else(||std::io::Error::other("Аккаунт удалён"))?;
+                a.live.apply(&params["report"]).map_err(std::io::Error::other)
+            }).map_err(|e|e.to_string())?;
+            return Ok(Value::Null);
+        }
+        if id == "chatgpt" && matches!(method,"auth.add"|"accounts.prepare"|"accounts.failover"|"accounts.select"|"accounts.remove") {
+            if !official { return Err("official plugin required".into()); }
+            let mut result=Value::Null;
+            self.store.update(|s| -> Result<(),std::io::Error> {
+                result=match method {
+                    "auth.add"=>crate::chatgpt_accounts::add(s,params["after"].clone()).map(|_|Value::Null),
+                    "accounts.prepare"=>crate::chatgpt_accounts::prepare(s),
+                    "accounts.select"=>crate::chatgpt_accounts::select(s,params["id"].as_str().unwrap_or("")).map(|_|Value::Null),
+                    "accounts.remove"=>crate::chatgpt_accounts::remove(s,params["id"].as_str().unwrap_or("")).map(|_|Value::Null),
+                    _=>crate::chatgpt_accounts::failover(s,params),
+                }.map_err(std::io::Error::other)?;
+                Ok(())
+            }).map_err(|e|e.to_string())?;
+            return Ok(result);
+        }
         if id == "chatgpt" && (method == "auth.get" || method == "auth.set") {
             if !official {
                 return Err("official plugin required".into());
             }
             if method == "auth.get" {
-                return Ok(self.store.with(|s| s.chatgpt.clone()));
+                return self.store.with(|s| match params["id"].as_str() {
+                    Some(id)=>s.chatgpt_accounts.iter().find(|a|a.id==id).map(|a|a.auth.clone()).ok_or("Аккаунт не найден".into()),
+                    None=>Ok(s.chatgpt.clone()),
+                });
             }
             let before = params.get("Before").or_else(|| params.get("before")).cloned().unwrap_or(Value::Null);
             let after = params.get("After").or_else(|| params.get("after")).cloned().ok_or("invalid auth update")?;
             self.store
                 .update(|st| {
+                    if let Some(id)=params["id"].as_str() {
+                        let account=st.chatgpt_accounts.iter_mut().find(|a|a.id==id).ok_or_else(||std::io::Error::other("Аккаунт не найден"))?;
+                        if norm(&account.auth)!=norm(&before){return Err(std::io::Error::other("account changed; retry login"));}
+                        let after=norm(&after);
+                        if after["_local_id"]!=account.auth["_local_id"] || after["account"]!=account.auth["account"] {return Err(std::io::Error::other("account identity changed"));}
+                        account.auth=after.clone();
+                        if st.chatgpt_active==id{st.chatgpt=after;}
+                        return Ok(());
+                    }
                     if norm(&st.chatgpt) != norm(&before) {
                         return Err(std::io::Error::other("account changed; retry login"));
                     }
-                    st.chatgpt = norm(&after);
+                    crate::chatgpt_accounts::refreshed(st,norm(&after));
                     if crate::chatgpt::signed_in(&st.chatgpt) {
                         st.auto_select_engine("chatgpt");
                     }
@@ -243,4 +278,53 @@ mod tests {
         for method in ["config.get","auth.get","legacy"] {assert!(svc.call("yandexhome",method,&json!({"service":"chatgpt"})).is_err());}
         assert_eq!(dir.parent(),Some(std::env::temp_dir().as_path()));assert!(dir.file_name().unwrap().to_string_lossy().starts_with("jarvis-coresvc-"));std::fs::remove_dir_all(dir).unwrap();
     }
+    #[test]
+    fn account_store_rejects_stale_refresh_and_untrusted_plugins() {
+        let dir=std::env::temp_dir().join(format!("jarvis-coresvc-{}",crate::settings::rand_hex(6)));
+        std::fs::create_dir_all(&dir).unwrap();let store=Store::open(dir.join("settings.json")).unwrap();
+        let mut svc=CoreServices{store:store.clone(),proxy:Proxy::new(store.clone()),data_dir:dir.clone(),info:Box::new(||json!({})),official:Box::new(|_|true)};
+        for id in ["a","b"] {svc.call("chatgpt","auth.add",&json!({"after":{"account":id,"refresh":"secret","access":"old"}})).unwrap();}
+        let before=store.get().chatgpt;let target=store.get().chatgpt_accounts[1].id.clone();
+        svc.call("chatgpt","accounts.select",&json!({"id":target})).unwrap();
+        assert!(svc.call("chatgpt","auth.set",&json!({"before":before,"after":{"account":"a","refresh":"rotated"}})).is_err());
+        assert_eq!(store.get().chatgpt["account"],"b");
+        svc.official=Box::new(|_|false);
+        for method in ["auth.get","auth.add","accounts.prepare","accounts.select","accounts.remove","accounts.failover"] {assert!(svc.call("chatgpt",method,&json!({})).is_err());assert!(svc.call("weather",method,&json!({})).is_err());}
+        let reloaded=Store::open(dir.join("settings.json")).unwrap();assert_eq!(reloaded.get().chatgpt_accounts.len(),2);assert_eq!(reloaded.get().chatgpt_active,target);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn inactive_account_refresh_preserves_selection_and_rejects_removed_account() {
+        let dir=std::env::temp_dir().join(format!("jarvis-coresvc-{}",crate::settings::rand_hex(6)));
+        std::fs::create_dir_all(&dir).unwrap();let store=Store::open(dir.join("settings.json")).unwrap();
+        let svc=CoreServices{store:store.clone(),proxy:Proxy::new(store.clone()),data_dir:dir.clone(),info:Box::new(||json!({})),official:Box::new(|_|true)};
+        for id in ["a","b"]{svc.call("chatgpt","auth.add",&json!({"after":{"account":id,"refresh":"old","access":"old"}})).unwrap();}
+        let active=store.get().chatgpt.clone();let id=store.get().chatgpt_accounts[1].id.clone();
+        let before=svc.call("chatgpt","auth.get",&json!({"id":id})).unwrap();let mut after=before.clone();after["refresh"]="rotated".into();
+        svc.call("chatgpt","auth.set",&json!({"id":id,"before":before,"after":after})).unwrap();
+        assert_eq!(store.get().chatgpt,active);assert_eq!(store.get().chatgpt_accounts[1].auth["refresh"],"rotated");
+        svc.call("chatgpt","accounts.remove",&json!({"id":id})).unwrap();
+        assert!(svc.call("chatgpt","auth.set",&json!({"id":id,"before":after,"after":before})).is_err());
+        assert!(svc.call("chatgpt","auth.get",&json!({"id":id})).is_err());assert_eq!(store.get().chatgpt,active);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn live_stats_follow_original_account_survive_reload_and_relogin_and_reject_deleted_ids(){
+        let dir=std::env::temp_dir().join(format!("jarvis-coresvc-{}",crate::settings::rand_hex(6)));std::fs::create_dir_all(&dir).unwrap();let store=Store::open(dir.join("settings.json")).unwrap();
+        let mut svc=CoreServices{store:store.clone(),proxy:Proxy::new(store.clone()),data_dir:dir.clone(),info:Box::new(||json!({})),official:Box::new(|_|true)};
+        for id in ["a","b"]{svc.call("chatgpt","auth.add",&json!({"after":{"account":id,"refresh":"secret"}})).unwrap();}
+        let old=store.get().chatgpt_active.clone();let other=store.get().chatgpt_accounts[1].id.clone();svc.call("chatgpt","accounts.select",&json!({"id":other})).unwrap();
+        let p=json!({"id":old,"report":{"session":"s","started_at":100,"opened":true,"closed":true,"connected_ms":1500,"sent_ms":1400,"received_ms":400,"limit":true,"limit_at":101}});
+        svc.call("chatgpt","voice.stats",&p).unwrap();svc.call("chatgpt","voice.stats",&p).unwrap();
+        svc.call("chatgpt","auth.add",&json!({"after":{"account":"a","refresh":"fresh"}})).unwrap();
+        let reload=Store::open(dir.join("settings.json")).unwrap();assert_eq!(reload.get().chatgpt_active,other);
+        let summary=crate::chatgpt_accounts::summary(&reload.get());assert_eq!(summary["accounts"][0]["live_stats"]["sessions"],1);assert_eq!(summary["accounts"][1]["live_stats"]["sessions"],0);assert_eq!(summary["accounts"][0]["live_stats"]["limit_events"][0]["at"],101);
+        assert!(!summary.to_string().contains("fresh"));assert!(!summary.to_string().contains("secret"));
+        svc.call("chatgpt","accounts.remove",&json!({"id":old})).unwrap();assert!(svc.call("chatgpt","voice.stats",&p).is_err());
+        svc.official=Box::new(|_|false);assert!(svc.call("chatgpt","voice.stats",&json!({"id":other,"report":p["report"]})).is_err());assert!(svc.call("weather","voice.stats",&p).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
 }

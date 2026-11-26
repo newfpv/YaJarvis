@@ -53,8 +53,10 @@ async fn vpn_call_carries_signaling_ice_dtls_opus_and_delegations(){
 async fn call(network:Value, fallback: bool){
     tokio::time::timeout(Duration::from_secs(25),async{
         let (events,event_rx)=tokio::sync::mpsc::channel(128);let mut event_rx=event_rx;
-        let services:Callback=Arc::new(move|method,params|{let events=events.clone();let network=network.clone();Box::pin(async move{match method.as_str(){
-            "network"=>Ok(network),"auth.get"=>Ok(json!({"access":"test-access","account":"test-account","refresh":"test-refresh","expires":super::super::now()+3600})),
+        let reports=Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));let stats=reports.clone();
+        let services:Callback=Arc::new(move|method,params|{let stats=stats.clone();let events=events.clone();let network=network.clone();Box::pin(async move{match method.as_str(){
+            "voice.stats"=>{stats.lock().unwrap().push(params);Ok(Value::Null)},
+            "network"=>Ok(network),"auth.get"|"accounts.prepare"=>Ok(json!({"_local_id":"test-account-id","access":"test-access","account":"test-account","refresh":"test-refresh","expires":super::super::now()+3600})),
             "voice.event"=>{events.send(params).await.map_err(|e|e.to_string())?;Ok(json!(true))},"voice.brain"=>{assert_eq!(params["task"],"test task");Ok(json!("done"))},_=>Err("unexpected service".into()),
         }})});
         let mut provider=ChatGpt::new(services);let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();provider.call_url=format!("http://{}/call",listener.local_addr().unwrap());
@@ -72,7 +74,7 @@ async fn call(network:Value, fallback: bool){
             for &model in models {
             let (mut socket,_)=listener.accept().await.unwrap();let mut request=Vec::new();let mut chunk=[0;4096];
             let header_end=loop{let n=socket.read(&mut chunk).await.unwrap();assert!(n>0);request.extend(&chunk[..n]);if let Some(at)=request.windows(4).position(|v|v==b"\r\n\r\n"){break at+4;}assert!(request.len()<65536);};
-            let headers=String::from_utf8_lossy(&request[..header_end]).to_lowercase();assert!(headers.contains("thread-id: thread-stable"));assert!(headers.contains("session-id: thread-stable"));
+            let headers=String::from_utf8_lossy(&request[..header_end]).to_lowercase();assert!(headers.contains("thread-id: test-account-id-thread-stable"));assert!(headers.contains("session-id: test-account-id-thread-stable"));
             let length:usize=headers.lines().find_map(|line|line.strip_prefix("content-length:").map(str::trim)).unwrap().parse().unwrap();while request.len()<header_end+length{let n=socket.read(&mut chunk).await.unwrap();assert!(n>0);request.extend(&chunk[..n]);}
             let body:Value=serde_json::from_slice(&request[header_end..header_end+length]).unwrap();assert_eq!(body["session"]["initial_items"][0]["role"],"developer");
             assert_eq!(body["session"]["model"], model);
@@ -145,7 +147,13 @@ async fn call(network:Value, fallback: bool){
         };
         tokio::join!(send,receive);
         assert!(started.elapsed()<Duration::from_millis(frames*20+400),"RTP playout drifted: {:?}",started.elapsed());
-        provider.request("voice.close",json!({"id":"local-call"})).await.unwrap();assert!(provider.request("voice.feed",json!({"id":"local-call","pcm":""})).await.is_err());remote.close().await.unwrap();
+        provider.request("voice.close",json!({"id":"local-call"})).await.unwrap();
+        {let reports=reports.lock().unwrap();let report=reports.iter().rev().find(|r|r["report"]["closed"]==true).expect("final stats");
+        assert_eq!(report["id"],"test-account-id");assert_eq!(report["report"]["opened"],true);
+        assert!(report["report"]["sent_ms"].as_u64().unwrap()>=20);
+        assert_eq!(report["report"]["received_ms"],frames*20);
+        assert!(report["report"]["connected_ms"].as_u64().unwrap()>=1500);assert!(!report.to_string().contains("test-access"));}
+        assert!(provider.request("voice.feed",json!({"id":"local-call","pcm":""})).await.is_err());remote.close().await.unwrap();
     }).await.unwrap();
 }
 
@@ -168,7 +176,7 @@ async fn voice_warm_builds_standby_without_socks_traffic_and_open_consumes_it() 
             Box::pin(async move {
                 match method.as_str() {
                     "network" => Ok(json!({})),
-                    "auth.get" => Ok(json!({"access":"test-access","account":"test-account","refresh":"test-refresh","expires":super::super::now()+3600})),
+                    "auth.get" | "accounts.prepare" => Ok(json!({"access":"test-access","account":"test-account","refresh":"test-refresh","expires":super::super::now()+3600})),
                     "voice.event" => { events.send(params).await.map_err(|e| e.to_string())?; Ok(json!(true)) }
                     _ => Err("unexpected service".into()),
                 }
@@ -247,7 +255,7 @@ async fn voice_say_waits_for_data_channel_open_after_dtls_connect() {
             Box::pin(async move {
                 match method.as_str() {
                     "network" => Ok(json!({})),
-                    "auth.get" => Ok(json!({"access":"test-access","account":"test-account","refresh":"test-refresh","expires":super::super::now()+3600})),
+                    "auth.get" | "accounts.prepare" => Ok(json!({"access":"test-access","account":"test-account","refresh":"test-refresh","expires":super::super::now()+3600})),
                     "voice.event" => Ok(json!(true)),
                     _ => Err("unexpected service".into()),
                 }
@@ -322,7 +330,7 @@ async fn rtp_playout_recovers_from_150ms_stall_without_dropping_packets() {
             Box::pin(async move {
                 match method.as_str() {
                     "network" => Ok(json!({})),
-                    "auth.get" => Ok(json!({"access":"test-access","account":"test-account","refresh":"test-refresh","expires":super::super::now()+3600})),
+                    "auth.get" | "accounts.prepare" => Ok(json!({"access":"test-access","account":"test-account","refresh":"test-refresh","expires":super::super::now()+3600})),
                     "voice.event" => { events.send(params).await.map_err(|e| e.to_string())?; Ok(json!(true)) }
                     _ => Err("unexpected service".into()),
                 }

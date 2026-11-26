@@ -57,9 +57,10 @@ fn unix() -> i64 {
 }
 
 pub fn voice_limit() -> Option<String> {
-    let remaining = LIMITED_UNTIL.load(Ordering::Relaxed) - unix();
-    (remaining > 0).then(|| format!("ChatGPT ограничил голосовые звонки аккаунта. Повторите через {} мин.", (remaining + 59) / 60))
+    // Eligibility and cooldown now belong to individual saved accounts.
+    None
 }
+
 fn clip_error(text:&str)->String{text.chars().take(240).collect()}
 async fn await_open(future:impl std::future::Future<Output=Result<Value,String>>,closed:&tokio::sync::Notify)->Result<(),String>{
     tokio::pin!(future);
@@ -179,7 +180,7 @@ impl ChatGptSession {
         SESSIONS.lock().unwrap().insert(self.id.clone(), Arc::downgrade(&self));
         let t0 = Instant::now();
         let open = async {
-            let left = Duration::from_secs(40).saturating_sub(t0.elapsed()).max(Duration::from_secs(1));
+            let left = Duration::from_secs(42).saturating_sub(t0.elapsed()).max(Duration::from_secs(1));
             let response = n.request("voice.open", json!({"id": self.id, "profile": {"voice": voice, "thread": thread}, "instructions": instructions}), left).await?;
             if let Some(model) = response["requested_model"].as_str() {
                 log::info!("ChatGPT: запрошена модель {model} (фактическую подтверждает событие сессии)");

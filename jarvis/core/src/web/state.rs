@@ -222,7 +222,7 @@ pub async fn state(State(app): State<App>) -> Json<Value> {
         "keys": {"openai": mask(&s.openai_key), "gemini": mask(&s.gemini_key), "grok": mask(&s.grok_key),
                  "elevenlabs": mask(&s.elevenlabs_key), "yandex": mask(&s.yandex_token)},
         "eleven_keys": eleven, "gemini_keys": gemini, "gemini_pool": gemini_pool_summary, "vpn": vpn,
-        "chatgpt": {"signed_in": crate::settings::has_all(&s.chatgpt, &["refresh", "account"]),
+        "chatgpt": {"accounts": crate::chatgpt_accounts::summary(&s)["accounts"], "active_id": s.chatgpt_active, "auto_switch":s.chatgpt_auto_switch, "signed_in": crate::settings::has_all(&s.chatgpt, &["refresh", "account"]),
                     "plan": str_of(&s.chatgpt, "plan"), "email": str_of(&s.chatgpt, "email"),
                     "login": chatgpt_login, "chat": super::memory::chat_state(&app), "memory": memory_state(&s,&app.plugins), "limited_until": crate::chatgpt::LIMITED_UNTIL.load(std::sync::atomic::Ordering::Relaxed)},
         "vless": vless,

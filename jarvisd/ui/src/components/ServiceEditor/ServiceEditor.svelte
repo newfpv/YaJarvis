@@ -82,7 +82,7 @@
   {@render drop("ha-disconnect", "Отключить", (event) => homeAssistant.disconnect(event))}
 {:else if id === "vpn" && vpn.set}
   {@render drop("vless-clear", "Убрать VPN")}
-{:else if logout && (id === "youtube" ? snapshot.youtube?.account?.signed_in : snapshot[id]?.signed_in)}
+{:else if id !== "chatgpt" && logout && (id === "youtube" ? snapshot.youtube?.account?.signed_in : snapshot[id]?.signed_in)}
   {@render drop(logout, "Выйти")}
 {:else if id === "youtube" && snapshot.youtube?.set}
   {@render drop("yt-clear", "Убрать куки")}

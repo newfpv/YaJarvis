@@ -284,6 +284,9 @@ pub struct Settings {
     pub gemini_keys: Vec<String>,
     pub grok_key: String,
     pub chatgpt: Value,
+    pub chatgpt_accounts: Vec<crate::chatgpt_accounts::Account>,
+    pub chatgpt_active: String,
+    pub chatgpt_auto_switch: bool,
     pub xiaomi: Value,
     pub tuya: Value,
     pub elevenlabs_key: String,
@@ -371,6 +374,7 @@ impl Default for Settings {
             gemini_keys: vec![],
             grok_key: String::new(),
             chatgpt: Value::Object(Map::new()),
+            chatgpt_accounts: vec![], chatgpt_active: String::new(), chatgpt_auto_switch: false,
             xiaomi: Value::Object(Map::new()),
             tuya: Value::Object(Map::new()),
             elevenlabs_key: String::new(),
@@ -827,7 +831,7 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
 
 /// Переносы старых форматов. true — файл надо переписать.
 fn migrate(s: &mut Settings) -> bool {
-    let mut dirty = false;
+    let mut dirty = crate::chatgpt_accounts::ensure(s);
     if s.session_key.is_empty() {
         s.session_key = rand_hex(32);
     }

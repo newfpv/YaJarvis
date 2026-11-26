@@ -1,4 +1,4 @@
-use super::{Callback,ChatGpt,opus,rtc_runtime::RoutedRuntime};
+use super::{Callback,ChatGpt,opus,rtc_runtime::RoutedRuntime,live_stats::Meter};
 use std::{sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}},collections::BTreeMap,time::{Duration,Instant}};
 use serde_json::{Value,json};
 use base64::{Engine,engine::general_purpose::STANDARD as B64};
@@ -18,7 +18,7 @@ const CHATGPT_VOICES: &[&str] = &[
     "aube", "rivage", "bubbie", "haetsal", "hanul", "himari", "rindo", "leher", "neer",
     "miko", "sonna", "rio", "viola", "tinta",
 ];
-pub struct RtcVoice {pub id:String,pub requested_model:&'static str,pc:Arc<dyn PeerConnection>,dc:Arc<dyn DataChannel>,dc_state:tokio::sync::watch::Receiver<u8>,pending:Arc<Mutex<Vec<i16>>>,stop:tokio::sync::watch::Sender<bool>,tasks:Mutex<Vec<tokio::task::JoinHandle<()>>>}
+pub struct RtcVoice {pub id:String,pub requested_model:&'static str,meter:Arc<Meter>,pc:Arc<dyn PeerConnection>,dc:Arc<dyn DataChannel>,dc_state:tokio::sync::watch::Receiver<u8>,pending:Arc<Mutex<Vec<i16>>>,stop:tokio::sync::watch::Sender<bool>,tasks:Mutex<Vec<tokio::task::JoinHandle<()>>>}
 struct Guard(Option<Arc<dyn PeerConnection>>);
 impl Drop for Guard{fn drop(&mut self){if let Some(pc)=self.0.take() && let Ok(rt)=tokio::runtime::Handle::try_current(){rt.spawn(async move{let _=pc.close().await;});}}}
 struct StandbyInner{
@@ -73,7 +73,7 @@ impl StandbyPeer{
         let (stop,stop_rx)=tokio::sync::watch::channel(false);
         let (conn_tx,conn_rx)=tokio::sync::watch::channel(0u8);
         let gathered=Arc::new(tokio::sync::Notify::new());
-        let handler=Arc::new(Handler{gathered:gathered.clone(),services:services.clone(),id:Mutex::new(None),stop:stop_rx.clone(),conn_tx,track:AtomicBool::new(false),broken:AtomicBool::new(false)});
+        let handler=Arc::new(Handler{gathered:gathered.clone(),services:services.clone(),id:Mutex::new(None),meter:Mutex::new(None),stop:stop_rx.clone(),conn_tx,track:AtomicBool::new(false),broken:AtomicBool::new(false)});
         let pc:Arc<dyn PeerConnection>=Arc::new(PeerConnectionBuilder::new().with_configuration(RTCConfigurationBuilder::new().build()).with_setting_engine(setting).with_media_engine(media).with_interceptor_registry(registry).with_runtime(runtime.clone()).with_handler(handler.clone()).with_udp_addrs(if tcp_only{vec![]}else{vec!["0.0.0.0:0".to_string()]}).with_tcp_addrs(vec!["0.0.0.0:0".to_string()]).build().await.map_err(|e|e.to_string())?);
         let mut guard=Guard(Some(pc.clone()));
         let ssrc=0x4a415256;
@@ -178,7 +178,7 @@ async fn forward_audio(
         }
     }
 }
-struct Handler {gathered:Arc<tokio::sync::Notify>,services:Callback,id:Mutex<Option<String>>,stop:tokio::sync::watch::Receiver<bool>,conn_tx:tokio::sync::watch::Sender<u8>,track:AtomicBool,broken:AtomicBool}
+struct Handler {gathered:Arc<tokio::sync::Notify>,services:Callback,id:Mutex<Option<String>>,meter:Mutex<Option<Arc<Meter>>>,stop:tokio::sync::watch::Receiver<bool>,conn_tx:tokio::sync::watch::Sender<u8>,track:AtomicBool,broken:AtomicBool}
 impl Handler {
     fn claim(&self, id: String) { *self.id.lock().unwrap() = Some(id); }
     fn current_id(&self) -> Option<String> { self.id.lock().unwrap().clone() }
@@ -193,6 +193,7 @@ impl PeerConnectionEventHandler for Handler {
             }
             RTCPeerConnectionState::Failed|RTCPeerConnectionState::Closed => {
                 self.broken.store(true,Ordering::Release);
+                if let Some(m)=self.meter.lock().unwrap().as_ref(){m.finish_background();}
                 let _ = self.conn_tx.send_replace(2);
                 if let Some(id)=self.current_id(){emit(&self.services,&id,"closed",Value::Null).await;}
             }
@@ -202,7 +203,7 @@ impl PeerConnectionEventHandler for Handler {
     async fn on_track(&self,track:Arc<dyn TrackRemote>){
         if track.kind().await!=RtpCodecKind::Audio || self.track.swap(true,Ordering::SeqCst){return;}
         let Some(id)=self.current_id() else {return;};
-        let services=self.services.clone();let mut stop=self.stop.clone();
+        let services=self.services.clone();let mut stop=self.stop.clone();let meter=self.meter.lock().unwrap().clone();
         let (audio, receiver) = tokio::sync::mpsc::channel(16);
         tokio::spawn(forward_audio(services.clone(), id.clone(), stop.clone(), receiver));
         tokio::spawn(async move {
@@ -300,6 +301,7 @@ impl PeerConnectionEventHandler for Handler {
                     }
                     let input=packet.as_deref().or_else(||if fec{packets.get(&next.wrapping_add(1)).map(Vec::as_slice)}else{None});
                     let pcm=match decoder.decode(input,fec,if packet.is_some(){5760}else{frame}){Ok(p)=>p,Err(_)=>{emit(&services,&id,"error",json!("Повреждённый пакет Opus")).await;break;}};
+                    if packet.is_some(){if let Some(m)=&meter{m.received(pcm.len());}}
                     frame=pcm.len().max(120);expected=Some(next.wrapping_add(1));
                     // Keep the RTP playout clock anchored. Scheduling from `now` adds
                     // every timer's lateness to all subsequent packets and builds seconds of lag.
@@ -328,30 +330,31 @@ impl PeerConnectionEventHandler for Handler {
     }
 }
 impl RtcVoice {
-    pub async fn open(provider:&ChatGpt,params:&Value)->Result<Arc<Self>,String>{
+    #[cfg(test)]
+    pub async fn open(provider:&ChatGpt,params:&Value)->Result<Arc<Self>,String>{Self::open_auth(provider,params,provider.token().await?).await}
+    pub async fn open_auth(provider:&ChatGpt,params:&Value,auth:Value)->Result<Arc<Self>,String>{
         let t0=Instant::now();
         let id=params["id"].as_str().filter(|s|!s.is_empty()&&s.len()<=128).ok_or("Неверный ID звонка")?.to_string();
         let voice = selected_voice(&params["profile"]["voice"])?;
         let network=(provider.services)("network".into(),json!({})).await?;
         if let Some(error)=network["error"].as_str(){return Err(error.into());}
-        let (peer,peer_source,auth)=match provider.take_standby(&network){
-            Some(peer)=>(peer,"standby",provider.token().await?),
-            None=>{
-                let (peer,auth)=tokio::try_join!(StandbyPeer::build(&provider.services,network.clone()),provider.token())?;
-                (peer,"cold",auth)
-            }
+        let (peer,peer_source)=match provider.take_standby(&network){
+            Some(peer)=>(peer,"standby"),
+            None=>(StandbyPeer::build(&provider.services,network.clone()).await?,"cold"),
         };
         let t_peer=t0.elapsed();
         let mut peer=peer;
         let StandbyInner{runtime,tcp_only,pc,track,dc,offer,handler,mut conn_rx,stop,stop_rx:receiver,..}=peer.0.take().unwrap();
         let mut guard=Guard(Some(pc.clone()));
-        handler.claim(id.clone());
         runtime.arm();
         let ssrc=0x4a415256;
         let access=auth["access"].as_str().ok_or("Нет токена")?;let account=auth["account"].as_str().ok_or("Нет аккаунта")?;
         let instructions=params["instructions"].as_str().unwrap_or("");
         let thread=params["profile"]["thread"].as_str().filter(|s|!s.is_empty()&&s.len()<=128).unwrap_or(&id);
+        let scoped_thread=format!("{}-{}",auth["_local_id"].as_str().unwrap_or("legacy"),thread.chars().take(90).collect::<String>());
+        let thread=scoped_thread.as_str();
         let client = provider.client_for(&network)?;
+        let meter=Meter::new(provider.services.clone(),&auth,&id);
         let send = |model| {
             let session=json!({"model":model,"instructions":instructions,"audio":{"output":{"voice":voice}},"delegation":{"type":"client"},"initial_items":[{"type":"message","role":"developer","content":[{"type":"input_text","text":instructions}]}]});
             client.post(&provider.call_url).bearer_auth(access).header("ChatGPT-Account-ID",account)
@@ -370,15 +373,13 @@ impl RtcVoice {
             response = send(requested_model).await.map_err(|_| "Не создать резервный звонок ChatGPT")?;
         }
         let status = response.status();
-        if status.as_u16() == 429 {
-            let retry = response.headers().get("Retry-After").and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok()).unwrap_or(60).clamp(1, 86400);
-            emit(&provider.services, &id, "limit", json!(retry)).await;
-            return Err(format!("ChatGPT ограничил голосовые звонки аккаунта (429). Повторите через {} мин.", retry.div_ceil(60)));
-        }
         if !status.is_success() {
-            return Err(format!("ChatGPT не открыл звонок с голосом {voice} на модели {requested_model} ({status})"));
+            let error=super::account_error::rejected(response).await;
+            if super::account_error::Failure::parse(&error).is_some_and(|f|f.reason=="limit"){meter.limit();meter.finish_background();}
+            return Err(error);
         }
+        handler.claim(id.clone());
+        *handler.meter.lock().unwrap()=Some(meter.clone());
         let answer=response.text().await.map_err(|_|"Нет ответа SDP")?;if answer.len()>1024*1024{return Err("Слишком большой SDP".into());}
         let t_http=t0.elapsed();
         if tcp_only && !answer.lines().any(|line|line.starts_with("a=candidate:") && line.to_ascii_lowercase().contains(" tcp ")){return Err("VPN не поддерживает UDP, а ChatGPT не предложил TCP ICE".into());}
@@ -390,10 +391,11 @@ impl RtcVoice {
             if state==1{Ok(())}else{Err("Канал ChatGPT закрылся".to_string())}
         }).await
             .map_err(|_|format!("Звонок ChatGPT с голосом {voice} не соединился за 12 секунд"))??;
-        let t_dtls=t0.elapsed();
+        let t_dtls=t0.elapsed();meter.start();meter.background();
         eprintln!("ChatGPT: open breakdown: peer={}ms ({peer_source}) http={}ms dtls={}ms total={}ms",t_peer.as_millis(),(t_http-t_peer).as_millis(),(t_dtls-t_http).as_millis(),t_dtls.as_millis());
         let (dc_tx,dc_state)=tokio::sync::watch::channel(0u8);
         let pending=Arc::new(Mutex::new(Vec::<i16>::new()));let mut receiver_feed=receiver.clone();let feed=pending.clone();let services=provider.services.clone();let feed_id=id.clone();
+        let feed_meter=meter.clone();
         let feeder=tokio::spawn(async move{
             let mut encoder=match opus::Encoder::with_bitrate(bitrate){Ok(e)=>e,Err(e)=>{emit(&services,&feed_id,"error",e.into()).await;return;}};
             let mut mic = super::mic::MicClock::new();
@@ -402,9 +404,11 @@ impl RtcVoice {
                 let pcm = mic.take(&mut feed.lock().unwrap());
                 let packet=match encoder.encode(&pcm){Ok(p)=>p,Err(_)=>break};
                 if track.write_sample(ssrc,AUDIO_PAYLOAD,&rtc::media::Sample{data:packet.into(),duration:Duration::from_millis(20),..rtc::media::Sample::new(Instant::now())},&[]).await.is_err(){break;}
+                feed_meter.sent(20);
             }}}
         });
-        let mut events_stop=receiver.clone();let channel=dc.clone();let services=provider.services.clone();let event_id=id.clone();
+        let mut events_stop=receiver.clone();let channel=dc.clone();let services=provider.services.clone();let event_id=id.clone();let event_auth=auth.clone();
+        let event_meter=meter.clone();
         let reader=tokio::spawn(async move{
             let mut work=tokio::task::JoinSet::new();let mut seen=std::collections::HashSet::new();
             let mut dc_opened=false;
@@ -448,15 +452,18 @@ impl RtcVoice {
                             "error"=>{
                                 let detail=event["error"]["message"].as_str().or_else(||event["error"]["code"].as_str()).unwrap_or("Ошибка голосовой сессии ChatGPT");
                                 emit(&services,&event_id,"error",json!(detail.chars().take(240).collect::<String>())).await;
-                                let lower=detail.to_ascii_lowercase();
-                                if lower.contains("quota") || lower.contains("limit"){emit(&services,&event_id,"limit",Value::Null).await;break;}
+                                if let Some(f)=super::account_error::classify(0,&event,60){
+                                    if f.reason=="limit"{event_meter.limit();}
+                                    let _=(services)("accounts.failover".into(),json!({"before":event_auth,"reason":f.reason,"retry_s":f.retry,"tried":[event_auth["_local_id"]]})).await;
+                                    break;
+                                }
                             },_=>{},
                         }
                     },Some(DataChannelEvent::OnClose)|None=>break,_=>{},
                 }
-            }}let _=dc_tx.send_replace(2);emit(&services,&event_id,"closed",Value::Null).await;
+            }}event_meter.finish_background();let _=dc_tx.send_replace(2);emit(&services,&event_id,"closed",Value::Null).await;
         });
-        guard.0.take();Ok(Arc::new(Self{id,requested_model,pc,dc,dc_state,pending,stop,tasks:Mutex::new(vec![feeder,reader])}))
+        guard.0.take();Ok(Arc::new(Self{id,requested_model,meter,pc,dc,dc_state,pending,stop,tasks:Mutex::new(vec![feeder,reader])}))
     }
     pub fn feed(&self,data:&str)->Result<(),String>{
         if data.len()>256*1024{return Err("Слишком большой кадр микрофона".into());}let bytes=B64.decode(data).map_err(|_|"Неверный PCM")?;if bytes.len()%2!=0{return Err("Неверный PCM".into());}
@@ -474,8 +481,8 @@ impl RtcVoice {
         for part in chunks(text,500){self.dc.send_text(&json!({"type":"session.context.append","channel":"speakable","content":[{"type":"input_text","text":part}]}).to_string()).await.map_err(|e|e.to_string())?;}
         Ok(())
     }
-    pub async fn close(&self){self.stop.send_replace(true);let _=self.pc.close().await;let tasks=std::mem::take(&mut*self.tasks.lock().unwrap());for task in tasks{task.abort();let _=task.await;}}
+    pub async fn close(&self){self.meter.finish();self.meter.flush().await;self.stop.send_replace(true);let _=self.pc.close().await;let tasks=std::mem::take(&mut*self.tasks.lock().unwrap());for task in tasks{task.abort();let _=task.await;}}
 }
-impl Drop for RtcVoice{fn drop(&mut self){self.stop.send_replace(true);for task in self.tasks.lock().unwrap().drain(..){task.abort();}let pc=self.pc.clone();if let Ok(rt)=tokio::runtime::Handle::try_current(){rt.spawn(async move{let _=pc.close().await;});}}}
+impl Drop for RtcVoice{fn drop(&mut self){self.meter.finish_background();self.stop.send_replace(true);for task in self.tasks.lock().unwrap().drain(..){task.abort();}let pc=self.pc.clone();if let Ok(rt)=tokio::runtime::Handle::try_current(){rt.spawn(async move{let _=pc.close().await;});}}}
 fn chunks(text:&str,max:usize)->Vec<&str>{let mut result=vec![];let mut rest=text;while !rest.is_empty(){let mut end=rest.len().min(max);while !rest.is_char_boundary(end){end-=1;}if end==0{end=rest.chars().next().unwrap().len_utf8();}result.push(&rest[..end]);rest=&rest[end..];}result}
 #[cfg(test)]mod tests;

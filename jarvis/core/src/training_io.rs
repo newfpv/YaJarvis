@@ -86,6 +86,7 @@ impl Drop for ArchiveSocket {
 pub struct AudioBatch {
     pcm: Vec<i16>,
     hit: bool,
+    wake_id: Option<String>,
     discard: bool,
     prob: f32,
     peak_tail: usize,
@@ -95,6 +96,7 @@ impl AudioBatch {
     pub fn reset(&mut self) {
         self.pcm.clear();
         self.hit = false;
+        self.wake_id = None;
         self.discard = false;
         self.prob = 0.0;
         self.peak_tail = 0;
@@ -104,6 +106,7 @@ impl AudioBatch {
         &mut self,
         pcm: &[i16],
         hit: bool,
+        wake_id: Option<&str>,
         discard: bool,
         prob: f32,
         collect: bool,
@@ -112,6 +115,9 @@ impl AudioBatch {
         if hit {
             self.prob = self.prob.max(prob);
             self.peak_tail = 0;
+            if let Some(id) = wake_id {
+                self.wake_id = Some(id.to_owned());
+            }
         } else if !self.hit && prob > self.prob {
             self.prob = prob;
             self.peak_tail = 0;
@@ -130,7 +136,16 @@ impl AudioBatch {
                 .flat_map(|sample| sample.to_le_bytes())
                 .collect::<Vec<_>>(),
         );
-        let value = json!({"pcm":pcm,"hit":self.hit,"discard":self.discard,"prob":self.prob,"trigger_tail":self.peak_tail,"collect":collect,"limit":limit});
+        let value = json!({
+            "pcm": pcm,
+            "hit": self.hit,
+            "wake_id": self.wake_id,
+            "discard": self.discard,
+            "prob": self.prob,
+            "trigger_tail": self.peak_tail,
+            "collect": collect,
+            "limit": limit,
+        });
         self.reset();
         Some(value)
     }

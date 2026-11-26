@@ -317,6 +317,10 @@ async fn run(f: Flags, store: settings::Store) {
         }));
     }
     let mut tools = tools::Tools::new(host.clone(), store.clone());
+    tools.on_profile_switch = {
+        let (st, l) = (store.clone(), leds.clone());
+        Some(Arc::new(move || l.configure(&st.with(|s| s.led_for()))))
+    };
     tools.memory = Some(memory.clone());
     for (target, queue) in [(&mut tools.music, false), (&mut tools.music_queue, true)] {
         let (music, host) = (music.clone(), host.clone());

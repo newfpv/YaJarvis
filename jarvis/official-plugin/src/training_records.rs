@@ -8,7 +8,7 @@ use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     io::{self, Cursor, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -66,6 +66,9 @@ pub struct Records {
     root: PathBuf,
     files: Mutex<()>,
     sample: Mutex<Observe>,
+    recent_wakes: Mutex<VecDeque<(String, String, String)>>,
+    pending_reviews: Mutex<HashMap<String, String>>,
+    save_lock: tokio::sync::Mutex<()>,
     pub yadisk: Arc<YandexDisk>,
     pub background: Arc<Recorder>,
     offload: Mutex<Offload>,
@@ -94,6 +97,9 @@ impl Records {
             root,
             files: Mutex::new(()),
             sample: Mutex::default(),
+            recent_wakes: Mutex::default(),
+            pending_reviews: Mutex::default(),
+            save_lock: tokio::sync::Mutex::const_new(()),
             yadisk: yadisk.clone(),
             background,
             offload: Mutex::default(),
@@ -161,6 +167,25 @@ impl Records {
         None
     }
 
+    fn remember_wake(&self, wake_id: &str, kind: &str, name: &str) {
+        let mut recent = self.recent_wakes.lock().unwrap();
+        recent.retain(|(id, _, _)| id != wake_id);
+        recent.push_back((wake_id.to_owned(), kind.to_owned(), name.to_owned()));
+        while recent.len() > 64 {
+            recent.pop_front();
+        }
+    }
+
+    fn find_wake(&self, wake_id: &str) -> Option<(String, String)> {
+        self.recent_wakes
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(id, _, _)| id == wake_id)
+            .map(|(_, kind, name)| (kind.clone(), name.clone()))
+    }
+
     pub fn save_soon(
         self: &Arc<Self>,
         rt: &tokio::runtime::Handle,
@@ -169,18 +194,51 @@ impl Records {
         prob: f32,
         trigger_ms: Option<u32>,
         limit_mb: i64,
+        wake_id: Option<String>,
     ) {
         if self.write_pending.swap(true, Ordering::AcqRel) {
             return;
         }
         let records = self.clone();
         rt.spawn(async move {
+            struct PendingReset<'a>(&'a AtomicBool);
+            impl Drop for PendingReset<'_> {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _reset = PendingReset(&records.write_pending);
+            let _guard = records.save_lock.lock().await;
+            let mut actual_kind = kind.to_string();
+            let mut reviewed = false;
+            if let Some(wid) = &wake_id {
+                if records.find_wake(wid).is_some() {
+                    return;
+                }
+                if let Some(override_label) = records.pending_reviews.lock().unwrap().remove(wid) {
+                    actual_kind = override_label;
+                    reviewed = true;
+                }
+            }
             let files = records.clone();
-            let saved =
-                tokio::task::spawn_blocking(move || files.save(kind, &pcm, prob, trigger_ms, limit_mb))
-                    .await;
+            let save_kind = actual_kind.clone();
+            let saved = tokio::task::spawn_blocking(move || {
+                files.save_with_meta(
+                    &save_kind,
+                    &pcm,
+                    prob,
+                    trigger_ms,
+                    limit_mb,
+                    reviewed,
+                    || crate::storage::free_bytes(&files.root),
+                )
+            })
+            .await;
             match saved {
-                Ok(Ok(true)) => {
+                Ok(Ok(Some(name))) => {
+                    if let Some(wid) = &wake_id {
+                        records.remember_wake(wid, &actual_kind, &name);
+                    }
                     if records.yadisk.is_connected() {
                         records.start_offload();
                         let cached = records.yadisk.cached_clips();
@@ -189,11 +247,10 @@ impl Records {
                         }
                     }
                 }
-                Ok(Ok(false)) => {}
+                Ok(Ok(None)) => {}
                 Ok(Err(error)) => log::warn!("запись для обучения: {error}"),
                 Err(error) => log::warn!("запись для обучения: {error}"),
             }
-            records.write_pending.store(false, Ordering::Release);
         });
     }
 
@@ -519,6 +576,7 @@ impl Records {
     pub async fn snapshot(
         self: &Arc<Self>,
         mode: bool,
+        voice_review: bool,
         limit: i64,
         previous: bool,
         force_refresh: bool,
@@ -597,6 +655,7 @@ impl Records {
         };
         json!({
             "mode": mode,
+            "voice_review": voice_review,
             "limit_mb": limit.clamp(1, MAX_LIMIT_MB),
             "max_limit_mb": max_limit_mb,
             "prev_model": previous,
@@ -637,9 +696,23 @@ impl Records {
         limit_mb: i64,
         free_bytes: impl FnOnce() -> Option<u64>,
     ) -> Result<bool, String> {
+        self.save_with_meta(kind, pcm, prob, trigger_ms, limit_mb, false, free_bytes)
+            .map(|name| name.is_some())
+    }
+
+    fn save_with_meta(
+        &self,
+        kind: &str,
+        pcm: &[i16],
+        prob: f32,
+        trigger_ms: Option<u32>,
+        limit_mb: i64,
+        reviewed: bool,
+        free_bytes: impl FnOnce() -> Option<u64>,
+    ) -> Result<Option<String>, String> {
         let _lock = self.files.lock().unwrap();
         if self.stopped.load(Ordering::Acquire) {
-            return Ok(false);
+            return Ok(None);
         }
         let wav = pcm_wav(pcm);
         let compressed = compress(&wav).map_err(|e| e.to_string())?;
@@ -649,8 +722,9 @@ impl Records {
             wav
         };
         let trigger_part = trigger_ms.map(|ms| format!("_t{ms}")).unwrap_or_default();
+        let reviewed_part = if reviewed { "_r" } else { "" };
         let name = format!(
-            "{}-{}_p{}{trigger_part}.wav",
+            "{}-{}_p{}{trigger_part}{reviewed_part}.wav",
             jiff::Timestamp::now().strftime("%Y%m%d-%H%M%S"),
             rand_hex(5),
             (prob.clamp(0.0, 1.0) * 100.0) as u32
@@ -687,10 +761,10 @@ impl Records {
             if disk_budget.is_some_and(|budget| used.saturating_add(data_len) > budget) {
                 return Err(format!("на колонке осталось меньше {MIN_FREE_MB} МБ"));
             }
-            return Ok(false);
+            return Ok(None);
         }
         write_atomic(&path, &data, 0o600).map_err(|e| e.to_string())?;
-        Ok(true)
+        Ok(Some(name))
     }
 
     pub async fn read(self: &Arc<Self>, kind: &str, name: &str) -> Result<Vec<u8>, String> {
@@ -726,26 +800,37 @@ impl Records {
         name: &str,
         to: &str,
     ) -> Result<(), String> {
+        self.move_clip_returning_name(kind, name, to)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn move_clip_returning_name(
+        self: &Arc<Self>,
+        kind: &str,
+        name: &str,
+        to: &str,
+    ) -> Result<String, String> {
         let records = self.clone();
         let kind_owned = kind.to_owned();
         let name_owned = name.to_owned();
         let to_owned = to.to_owned();
-        let moved_local = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+        let moved_local = tokio::task::spawn_blocking(move || -> Result<Option<String>, String> {
             let _lock = records.files.lock().unwrap();
             if let Ok(cache_path) = records.path(REVIEW_CACHE, &kind_owned, &name_owned) {
                 let _ = fs::remove_file(cache_path);
             }
             let Ok((source, dir)) = records.locate(&kind_owned, &name_owned) else {
-                return Ok(false);
+                return Ok(None);
             };
             if to_owned == "delete" {
                 fs::remove_file(source).map_err(|e| e.to_string())?;
-                return Ok(true);
+                return Ok(Some(String::new()));
             }
             let stem = name_owned.trim_end_matches(".wav").trim_end_matches("_r");
             let mut target = records.path(dir, &to_owned, &format!("{stem}_r.wav"))?;
             if target == source {
-                return Ok(true);
+                return Ok(Some(name_owned));
             }
             if target.exists() {
                 target = records.path(
@@ -754,14 +839,18 @@ impl Records {
                     &format!("{stem}_{}_r.wav", rand_hex(4)),
                 )?;
             }
+            let new_name = target
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| format!("{stem}_r.wav"));
             fs::create_dir_all(target.parent().unwrap()).map_err(|e| e.to_string())?;
             fs::rename(source, target).map_err(|e| e.to_string())?;
-            Ok(true)
+            Ok(Some(new_name))
         })
         .await
         .map_err(|e| e.to_string())??;
 
-        if moved_local {
+        if let Some(new_name) = moved_local {
             if self.yadisk.is_connected() {
                 if self.yadisk.has_cached_clip(kind, name) {
                     let _ = self.yadisk.move_clip(kind, name, to).await;
@@ -772,7 +861,7 @@ impl Records {
                     self.start_prefetch(cached);
                 }
             }
-            return Ok(());
+            return Ok(new_name);
         }
         if self.yadisk.is_connected() {
             self.yadisk.move_clip(kind, name, to).await?;
@@ -780,9 +869,88 @@ impl Records {
             if !cached.is_empty() {
                 self.start_prefetch(cached);
             }
-            return Ok(());
+            let stem = name.trim_end_matches(".wav").trim_end_matches("_r");
+            return Ok(if to == "delete" {
+                String::new()
+            } else {
+                format!("{stem}_r.wav")
+            });
         }
         Err("Запись не найдена".into())
+    }
+
+    /// Переместить (или сохранить с пометкой `_r`) запись конкретного wake-события по голосовой разметке.
+    pub async fn review_wake(
+        self: &Arc<Self>,
+        wake_id: &str,
+        label: &str,
+        pcm: &[i16],
+        prob: f32,
+        limit_mb: i64,
+    ) -> Result<Value, String> {
+        if wake_id.is_empty()
+            || wake_id.len() > 48
+            || !wake_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err("Некорректный wake_id".into());
+        }
+        if !matches!(label, "false" | "pos") {
+            return Err("Неверная метка разметки".into());
+        }
+        let _guard = self.save_lock.lock().await;
+        if let Some((cur_kind, cur_name)) = self.find_wake(wake_id) {
+            let new_name = self.move_clip_returning_name(&cur_kind, &cur_name, label).await?;
+            self.remember_wake(wake_id, label, &new_name);
+            return Ok(json!({
+                "status": "updated",
+                "kind": label,
+                "name": new_name,
+                "reviewed": true,
+            }));
+        }
+        if pcm.len() < RATE / 2 {
+            return Err("нет аудиофрагмента пробуждения".into());
+        }
+        {
+            let mut pending = self.pending_reviews.lock().unwrap();
+            if pending.len() >= 64 {
+                pending.clear();
+            }
+            pending.insert(wake_id.to_owned(), label.to_owned());
+        }
+        let records = self.clone();
+        let pcm_owned = pcm.to_vec();
+        let label_owned = label.to_owned();
+        let trigger_ms = Some((pcm.len() * 1000 / RATE) as u32);
+        let saved = tokio::task::spawn_blocking(move || {
+            records.save_with_meta(
+                &label_owned,
+                &pcm_owned,
+                prob,
+                trigger_ms,
+                limit_mb,
+                true,
+                || crate::storage::free_bytes(&records.root),
+            )
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        let Some(name) = saved else {
+            return Err("лимит хранилища записей заполнен проверенными файлами".into());
+        };
+        self.pending_reviews.lock().unwrap().remove(wake_id);
+        self.remember_wake(wake_id, label, &name);
+        if self.yadisk.is_connected() {
+            self.start_offload();
+        }
+        Ok(json!({
+            "status": "saved",
+            "kind": label,
+            "name": name,
+            "reviewed": true,
+        }))
     }
 
     pub async fn clear(self: &Arc<Self>) -> Result<(), String> {
@@ -1369,7 +1537,7 @@ mod tests {
         assert_eq!(remaining[0].name, "c1.wav");
 
         // Snapshot shows 1 local + 2 remote clips with storage="yadisk" & remote=true.
-        let snap = records.snapshot(true, 10, false, true).await;
+        let snap = records.snapshot(true, false, 10, false, true).await;
         assert_eq!(snap["local"], 1);
         assert_eq!(snap["remote"], 2);
         assert_eq!(snap["offload"]["sent"], 2);
@@ -1427,7 +1595,7 @@ mod tests {
         records.move_clip("near", "n00_t2800.wav", "pos").await.unwrap();
         let _ = records.offload_pending().await.unwrap();
         assert_eq!(records.list_dir(CLIPS).len(), 19);
-        let snap2 = records.snapshot(true, 10, false, true).await;
+        let snap2 = records.snapshot(true, false, 10, false, true).await;
         assert_eq!(snap2["local"], 20); // 19 in CLIPS + 1 legacy local_bg.wav in OLD_CLIPS
         for _ in 0..40 {
             if records.list_dir(REVIEW_CACHE).len() >= 1 {
@@ -1456,7 +1624,8 @@ mod tests {
             .save_with_free("near", &[241; 16_000], 0.49, Some(2850), 100, || Some(200 << 20))
             .unwrap();
 
-        let snapshot = records.snapshot(true, 100, false, false).await;
+        let snapshot = records.snapshot(true, true, 100, false, false).await;
+        assert_eq!(snapshot["voice_review"], true);
         assert_eq!(snapshot["limit_mb"], 100);
         assert_eq!(snapshot["local"], 2);
         let saved_clip = snapshot["clips"]
@@ -1468,7 +1637,7 @@ mod tests {
         assert_eq!(saved_clip["trigger_ms"], 2850);
         assert!(reviewed.is_file());
         assert_eq!(
-            records.snapshot(true, 101, false, false).await["limit_mb"],
+            records.snapshot(true, false, 101, false, false).await["limit_mb"],
             100
         );
         fs::remove_dir_all(root).unwrap();
@@ -1547,5 +1716,78 @@ mod tests {
         assert_eq!(records.compact().unwrap()["changed"], 0);
         assert_eq!(records.read("near", "legacy.wav").await.unwrap(), raw);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn voice_review_moves_relabels_and_prevents_duplicates_without_dropping_errors() {
+        let root = std::env::temp_dir().join(format!("jarvis-voice-review-{}", rand_hex(5)));
+        let records = Records::new(root.clone());
+        let pcm: Vec<i16> = (0..16_000).map(|i| (i % 200) as i16).collect();
+        let rt = tokio::runtime::Handle::current();
+
+        // 1) Auto-saved pos clip is moved in-place to false/*_r.wav (no duplicate left in pos).
+        records.save_soon(&rt, "pos", pcm.clone(), 0.91, Some(1500), 10, Some("w111111".into()));
+        for _ in 0..40 {
+            if records.list_dir(CLIPS).len() == 1 && !records.write_pending.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(records.list_dir(CLIPS).len(), 1);
+        assert_eq!(records.list_dir(CLIPS)[0].kind, "pos");
+        assert!(!records.list_dir(CLIPS)[0].reviewed);
+
+        let moved = records.review_wake("w111111", "false", &pcm, 0.91, 10).await.unwrap();
+        assert_eq!(moved["status"], "updated");
+        assert_eq!(moved["kind"], "false");
+        assert_eq!(moved["reviewed"], true);
+        let clips = records.list_dir(CLIPS);
+        assert_eq!(clips.len(), 1);
+        assert_eq!(clips[0].kind, "false");
+        assert!(clips[0].reviewed);
+
+        // 2) Repeated idempotent call and switching false -> pos keep 1 clip without duplicates.
+        let again = records.review_wake("w111111", "false", &pcm, 0.91, 10).await.unwrap();
+        assert_eq!(again["kind"], "false");
+        assert_eq!(records.list_dir(CLIPS).len(), 1);
+
+        let relabeled = records.review_wake("w111111", "pos", &pcm, 0.91, 10).await.unwrap();
+        assert_eq!(relabeled["kind"], "pos");
+        let clips = records.list_dir(CLIPS);
+        assert_eq!(clips.len(), 1);
+        assert_eq!(clips[0].kind, "pos");
+        assert!(clips[0].reviewed);
+
+        // 3) Direct reviewed save when train_mode=false + late save_soon for same wake_id does not duplicate.
+        let direct = records.review_wake("w222222", "false", &pcm, 0.88, 10).await.unwrap();
+        assert_eq!(direct["status"], "saved");
+        assert_eq!(direct["kind"], "false");
+        assert_eq!(records.list_dir(CLIPS).len(), 2);
+
+        records.save_soon(&rt, "pos", pcm.clone(), 0.88, Some(1500), 10, Some("w222222".into()));
+        for _ in 0..20 {
+            if !records.write_pending.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        assert_eq!(records.list_dir(CLIPS).len(), 2);
+
+        let snap = records.snapshot(false, true, 10, false, false).await;
+        assert_eq!(snap["mode"], false);
+        assert_eq!(snap["voice_review"], true);
+
+        // 4) Low free disk space and full reviewed budget surface errors instead of returning Ok.
+        let low_disk = records
+            .save_with_meta("false", &pcm, 0.9, Some(1500), 100, true, || Some(4 << 20))
+            .unwrap_err();
+        assert!(low_disk.contains("5 МБ"));
+
+        let keep_path = root.join(CLIPS).join("pos").join("full_r.wav");
+        fs::File::create(&keep_path).unwrap().set_len(1 << 20).unwrap();
+        let full_err = records.review_wake("w999999", "false", &pcm, 0.95, 1).await.unwrap_err();
+        assert!(full_err.contains("лимит") || full_err.contains("5 МБ"));
+
+        let _ = fs::remove_dir_all(root);
     }
 }

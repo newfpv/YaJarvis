@@ -62,6 +62,7 @@ pub struct Dialog {
     route: String,
     st: Mutex<DState>,
     close_requested: AtomicBool,
+    close_after_reply: AtomicBool,
 }
 
 const PROMISES: &[&str] = &["поищу", "найду", "подберу", "включу", "включаю", "поставлю", "запущу"];
@@ -82,6 +83,7 @@ impl Dialog {
             route: route.into(),
             st: Mutex::new(DState { model: model.into(), last_activity: Some(Instant::now()), ..Default::default() }),
             close_requested: AtomicBool::new(false),
+            close_after_reply: AtomicBool::new(false),
         }
     }
 
@@ -91,6 +93,18 @@ impl Dialog {
 
     pub fn close_requested(&self) -> bool {
         self.close_requested.load(Ordering::SeqCst)
+    }
+
+    pub fn request_close_after_reply(&self) {
+        self.close_after_reply.store(true, Ordering::SeqCst);
+    }
+
+    pub fn close_after_reply_requested(&self) -> bool {
+        self.close_after_reply.load(Ordering::SeqCst)
+    }
+
+    pub fn is_turn_complete(&self) -> bool {
+        self.st.lock().unwrap().turn_complete
     }
 
     pub fn on_bot_note(&self, text: &str) {

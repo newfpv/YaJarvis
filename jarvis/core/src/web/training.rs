@@ -55,13 +55,14 @@ struct ListQuery {
 }
 
 async fn list(State(app): State<App>, Query(q): Query<ListQuery>) -> Response {
-    let (mode, limit) = app.store.with(|s| (s.train_mode, s.train_limit_mb));
+    let (mode, limit, voice_review) =
+        app.store.with(|s| (s.train_mode, s.train_limit_mb, s.train_voice_review));
     let refresh = q.refresh.unwrap_or(0) != 0;
     result(
         request(
             &app,
             "training.records",
-            json!({"mode": mode, "limit": limit, "refresh": refresh}),
+            json!({"mode": mode, "limit": limit, "voice_review": voice_review, "refresh": refresh}),
         )
         .await,
     )
@@ -74,6 +75,7 @@ async fn compact(State(app): State<App>) -> Response {
 #[derive(Deserialize)]
 struct Settings {
     mode: Option<bool>,
+    voice_review: Option<bool>,
     limit_mb: Option<i64>,
 }
 
@@ -81,6 +83,9 @@ async fn settings(State(app): State<App>, Json(input): Json<Settings>) -> Respon
     match app.store.update(|s| -> std::io::Result<()> {
         if let Some(mode) = input.mode {
             s.train_mode = mode;
+        }
+        if let Some(voice_review) = input.voice_review {
+            s.train_voice_review = voice_review;
         }
         if let Some(limit) = input.limit_mb {
             s.train_limit_mb = limit.clamp(1, MAX_TRAIN_LIMIT_MB);

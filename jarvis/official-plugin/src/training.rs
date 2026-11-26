@@ -74,15 +74,44 @@ impl Training {
                         let clip = &ring[ring.len().saturating_sub(RATE * 3)..];
                         if clip.len() >= RATE {
                             let limit = params["limit"].as_i64().unwrap_or(1);
+                            let wake_id = params["wake_id"]
+                                .as_str()
+                                .filter(|s| !s.is_empty() && kind == "pos")
+                                .map(str::to_owned);
                             let trigger_ms = (kind != "bg").then(|| {
                                 (clip.len().saturating_sub(trigger_tail) * 1000 / RATE) as u32
                             });
-                            self.records
-                                .save_soon(&rt, kind, clip.to_vec(), prob, trigger_ms, limit);
+                            self.records.save_soon(
+                                &rt,
+                                kind,
+                                clip.to_vec(),
+                                prob,
+                                trigger_ms,
+                                limit,
+                                wake_id,
+                            );
                         }
                     }
                 }
                 Ok(Value::Null)
+            }
+            "training.review_wake" => {
+                let wake_id = field("wake_id")?;
+                let label = field("label")?;
+                let pcm = if let Some(b64) = params["pcm"].as_str().filter(|s| !s.is_empty()) {
+                    let bytes = B64.decode(b64).map_err(|error| error.to_string())?;
+                    bytes
+                        .chunks_exact(2)
+                        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let prob = params["prob"].as_f64().unwrap_or(0.95) as f32;
+                let limit = params["limit"].as_i64().unwrap_or(1);
+                self.records
+                    .review_wake(wake_id, label, &pcm, prob, limit)
+                    .await
             }
             "training.background.status" => Ok(self.records.background.status()),
             "training.background.start" => {
@@ -114,6 +143,7 @@ impl Training {
                     .records
                     .snapshot(
                         params["mode"] == true,
+                        params["voice_review"] == true,
                         params["limit"].as_i64().unwrap_or(1),
                         previous,
                         params["refresh"] == true,

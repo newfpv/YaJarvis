@@ -198,6 +198,27 @@ pub fn alice_skill_for(text: &str, yandex_music: bool) -> Option<String> {
     alice_skill(text).filter(|b| yandex_music || !alice_music_request(b))
 }
 
+re!(PROFILE_VERB, r"^(?:переключ(?:и|ись|ить)|смен(?:и|ить)|включ(?:и|ить)|постав(?:ь|ить)|выбер(?:и|ать)|активируй)\s+(.+)$");
+re!(PROFILE_NOUN, r"(?:^|\s)(?:профил[ьяюе]?|ассистент[ауе]?)(?:\s|$)");
+re!(PROFILE_FILLER, r"^(?:профил[ьяюе]?|ассистент[ауе]?|пожалуйста|режим[ае]?|на|в|для)$");
+
+/// Быстрая команда переключения профиля ассистента («включи детский профиль», «переключи профиль на братишку»).
+pub fn profile_switch_target(text: &str) -> Option<String> {
+    let bare = strip_lead(&norm_text(text));
+    if !PROFILE_NOUN.is_match(&bare) {
+        return None;
+    }
+    let caps = PROFILE_VERB.captures(&bare)?;
+    let target = caps
+        .get(1)?
+        .as_str()
+        .split_whitespace()
+        .filter(|w| !PROFILE_FILLER.is_match(w))
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!target.is_empty()).then_some(target)
+}
+
 /// Короткая команда умного дома без обращения к каталогу устройств — её можно отдать Алисе целиком.
 pub fn home_command_local(text: &str) -> Option<String> {
     if youtube_request(text) || clarification(text).is_some() {
@@ -388,5 +409,17 @@ mod tests {
         assert!(!has_name("на улице сегодня жарко"));
         assert_eq!(command_after_lost_name("Сейчас отключи свет").as_deref(), Some("джарвис отключи свет"));
         assert_eq!(earcon(true).len(), 1120 + 1440 + 640 + 1600);
+    }
+
+    #[test]
+    fn parses_profile_switch_without_catching_smart_home() {
+        assert_eq!(profile_switch_target("Джарвис, включи детский профиль").as_deref(), Some("детский"));
+        assert_eq!(profile_switch_target("переключи профиль на взрослый").as_deref(), Some("взрослый"));
+        assert_eq!(profile_switch_target("переключи ассистента на братишку, пожалуйста").as_deref(), Some("братишку"));
+        assert_eq!(profile_switch_target("смени профиль на джарвис").as_deref(), Some("джарвис"));
+        assert!(profile_switch_target("включи свет").is_none());
+        assert!(profile_switch_target("включи детский свет").is_none());
+        assert!(profile_switch_target("включи ночной режим").is_none());
+        assert!(profile_switch_target("включи музыку").is_none());
     }
 }

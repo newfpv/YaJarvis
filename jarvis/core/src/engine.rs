@@ -647,14 +647,22 @@ impl Engine {
                         } else {
                             false
                         };
+                        let wake_id = (!busy && live.is_none() && hit)
+                            .then(|| format!("w{}", crate::settings::rand_hex(6)));
                         if collect || background {
                             let limit = e.store.train_limit_mb();
                             let discard = busy || live.is_some() || e.saying.load(Ordering::Relaxed) || e.player.playing() || !ready || !enabled;
-                            if let Some(frame) = batch.push(&raw, hit, discard, prob, collect, limit) {
+                            if let Some(frame) = batch.push(&raw, hit, wake_id.as_deref(), discard, prob, collect, limit) {
                                 let _ = training.try_send(frame);
                             }
                         } else {
                             batch.reset();
+                        }
+                        if live.is_none() && !busy && hit {
+                            let p = det.wake_prob();
+                            det.reset(); // хвост этого же слова не должен сработать ещё раз
+                            e.trigger_with_wake("слово", p, wake_id);
+                            continue;
                         }
                     } else {
                         batch.reset();
@@ -784,6 +792,10 @@ impl Engine {
 
     /// Начать разговор (по слову, по кнопке в настройках).
     pub fn trigger(self: &Arc<Self>, source: &str, prob: f32) {
+        self.trigger_with_wake(source, prob, None);
+    }
+
+    fn trigger_with_wake(self: &Arc<Self>, source: &str, prob: f32, wake_id: Option<String>) {
         if source == "слово" && self.recording_word.load(Ordering::Acquire) { return; }
         let (clip, wake_at) = {
             let mut st = self.st.lock().unwrap();
@@ -846,7 +858,7 @@ impl Engine {
                 }
                 let mut guard = ConverseGuard { engine: &e, completed: false };
                 let preroll = if by_word { clip.clone() } else { vec![] };
-                let failure = e.converse(by_word, sure, preroll, clip, wake_at);
+                let failure = e.converse(by_word, sure, preroll, clip, wake_at, prob, wake_id);
                 guard.completed = true;
                 let queued = {
                     let mut st = e.st.lock().unwrap();
@@ -1131,6 +1143,8 @@ impl Engine {
         preroll: Vec<i16>,
         clip: Vec<i16>,
         wake_at: Instant,
+        wake_prob: f32,
+        wake_id: Option<String>,
     ) -> Option<crate::voice_error::VoiceFailure> {
         let s = self.store.get();
         let p = s.active_profile();
@@ -1181,7 +1195,30 @@ impl Engine {
         let opening_at = wake_at;
         let mut ready_at = Instant::now();
         let mut last_voice: Option<Instant> = None;
-        let _ = (sure, &clip);
+        let mut close_armed_at: Option<Instant> = None;
+        let close_after_flag = Arc::new(AtomicBool::new(false));
+        let wake_ctx = (by_word
+            && self.store.train_voice_review()
+            && self.host.provider("training").is_ok()
+            && self.listener.is_default_phrase()
+            && !std::path::Path::new("/data/opt/jarvisd/no-mic").exists()
+            && !clip.is_empty())
+        .then(|| {
+            let wid = wake_id.unwrap_or_else(|| format!("w{}", crate::settings::rand_hex(6)));
+            crate::tools::ActiveWake {
+                wake_id: wid,
+                clip: clip.clone(),
+                prob: wake_prob,
+            }
+        });
+        let _session_guard = self.tools.enter_voice_session(crate::tools::VoiceSessionContext {
+            close_after_reply: {
+                let flag = close_after_flag.clone();
+                Arc::new(move || flag.store(true, Ordering::SeqCst))
+            },
+            wake: wake_ctx,
+        });
+        let _ = sure;
 
         // открыть разговор с моделью и отдать ему весь звук с момента слова
         let open = |sess: &mut Option<Arc<dyn Session>>, out: &mut Option<std::sync::mpsc::Receiver<Vec<i16>>>, ready_at: &mut Instant| -> Result<(), Option<crate::voice_error::VoiceFailure>> {
@@ -1364,6 +1401,22 @@ impl Engine {
                 close(&sess);
                 return None;
             }
+            if close_after_flag.load(Ordering::SeqCst) || x.dialog().close_after_reply_requested() {
+                let armed = *close_armed_at.get_or_insert_with(Instant::now);
+                let wait = if x.dialog().is_turn_complete() {
+                    Duration::from_millis(300)
+                } else {
+                    Duration::from_millis(800)
+                };
+                let done_speaking = last_voice.is_some_and(|t| t >= armed && t.elapsed() >= wait);
+                if done_speaking || armed.elapsed() >= Duration::from_secs(8) {
+                    log::info!("разговор: завершён после подтверждения инструмента");
+                    self.player.finish(Duration::from_secs(3));
+                    x.dialog().finish_turn("");
+                    close(&sess);
+                    return None;
+                }
+            }
             if tick.elapsed() < Duration::from_millis(100) {
                 continue;
             }
@@ -1446,6 +1499,17 @@ impl Engine {
             quiet();
             log::info!("Джарвис: «{text}» — разговор закрыт, музыка не тронута ({from})");
             note("стоп", "");
+            return true;
+        }
+        if self.store.with(|s| s.profiles.len() > 1)
+            && let Some(target) = fastcmd::profile_switch_target(&cmd)
+        {
+            let answer = match self.tools.switch_profile(&target) {
+                Ok(answer) | Err(answer) => answer,
+            };
+            quiet();
+            note("профиль", &answer);
+            (self.say_hook())(answer);
             return true;
         }
         if fastcmd::youtube_request(&cmd)

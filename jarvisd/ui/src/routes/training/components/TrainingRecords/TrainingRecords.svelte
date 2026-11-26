@@ -126,7 +126,7 @@
 
   function changeSettings(event, field, value) {
     const input = event.currentTarget;
-    if (field === "mode") input.checked = data.mode;
+    if (field === "mode" || field === "voice_review") input.checked = Boolean(data[field]);
     else input.value = data.limit_mb;
     if (busy) return;
     void run(async () => {
@@ -189,6 +189,11 @@
         <input type="checkbox" checked={data.mode} disabled={busy}
           onchange={(event) => changeSettings(event, "mode", event.currentTarget.checked)}>
         <span class="tr"></span>Собирать примеры
+      </label>
+      <label class="sw">
+        <input type="checkbox" checked={Boolean(data.voice_review)} disabled={busy}
+          onchange={(event) => changeSettings(event, "voice_review", event.currentTarget.checked)}>
+        <span class="tr"></span>Разметка голосом («тебе послышалось» / «правильно услышал»)
       </label>
       <div class="f">
         <label for="train-limit">Лимит на колонке <b class="val">{(data.used_kb / 1024).toFixed(1)} МБ занято</b></label>

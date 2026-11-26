@@ -86,6 +86,17 @@ impl Classic {
         if crate::fastcmd::is_stop(command){
             self.dialog.annotate("стоп","");self.dialog.finish_turn("");self.close();return Ok(());
         }
+        if context.tools.store.with(|s| s.profiles.len() > 1)
+            && let Some(target) = crate::fastcmd::profile_switch_target(command)
+        {
+            let answer = match context.tools.switch_profile(&target) {
+                Ok(answer) | Err(answer) => answer,
+            };
+            self.dialog.on_bot(&answer);
+            self.speak(context, &answer, generation).await?;
+            self.dialog.finish_turn("");
+            return Ok(());
+        }
         if let Some(question)=crate::fastcmd::clarification(command) {
             self.dialog.annotate("уточнение",question);self.speak(context,question,generation).await?;self.dialog.finish_turn("");return Ok(());
         }

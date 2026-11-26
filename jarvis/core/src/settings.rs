@@ -340,6 +340,8 @@ pub struct Settings {
     pub night: NightSettings,
 
     pub train_mode: bool,
+    #[serde(default)]
+    pub train_voice_review: bool,
     pub train_limit_mb: i64,
 
     pub update_repo: String,
@@ -423,6 +425,7 @@ impl Default for Settings {
             radio_off: false,
             night: NightSettings::default(),
             train_mode: false,
+            train_voice_review: false,
             train_limit_mb: 2,
             update_repo: String::new(),
             update_check: true,
@@ -603,6 +606,7 @@ struct Hot {
     mic_gain_db: AtomicI64,
     wake_sensitivity: AtomicI64,
     train_mode: AtomicBool,
+    train_voice_review: AtomicBool,
     train_limit_mb: AtomicI64,
     tz: RwLock<jiff::tz::TimeZone>,
 }
@@ -620,6 +624,7 @@ impl Hot {
             mic_gain_db: AtomicI64::new(s.mic_gain_db),
             wake_sensitivity: AtomicI64::new(s.wake_sensitivity),
             train_mode: AtomicBool::new(s.train_mode),
+            train_voice_review: AtomicBool::new(s.train_voice_review),
             train_limit_mb: AtomicI64::new(s.train_limit_mb),
             tz: RwLock::new(Self::parse_tz(&s.timezone)),
         }
@@ -632,6 +637,7 @@ impl Hot {
         self.mic_gain_db.store(s.mic_gain_db, Ordering::Relaxed);
         self.wake_sensitivity.store(s.wake_sensitivity, Ordering::Relaxed);
         self.train_mode.store(s.train_mode, Ordering::Relaxed);
+        self.train_voice_review.store(s.train_voice_review, Ordering::Relaxed);
         self.train_limit_mb.store(s.train_limit_mb, Ordering::Relaxed);
         *self.tz.write().unwrap() = Self::parse_tz(&s.timezone);
     }
@@ -685,6 +691,7 @@ impl Store {
     pub fn mic_gain_db(&self) -> i64 { self.hot.mic_gain_db.load(Ordering::Relaxed) }
     pub fn wake_sensitivity(&self) -> i64 { self.hot.wake_sensitivity.load(Ordering::Relaxed) }
     pub fn train_mode(&self) -> bool { self.hot.train_mode.load(Ordering::Relaxed) }
+    pub fn train_voice_review(&self) -> bool { self.hot.train_voice_review.load(Ordering::Relaxed) }
     pub fn train_limit_mb(&self) -> i64 { self.hot.train_limit_mb.load(Ordering::Relaxed) }
     pub fn timezone(&self) -> jiff::tz::TimeZone { self.hot.tz.read().unwrap().clone() }
     pub fn now(&self) -> jiff::Zoned { jiff::Timestamp::now().to_zoned(self.timezone()) }

@@ -59,6 +59,7 @@ fn patch_settings(s: &mut Settings, v: &Value) -> Result<(), std::io::Error> {
         "language",
         "led",
         "train_mode",
+        "train_voice_review",
         "train_limit_mb",
         "night",
         "radio",
@@ -372,7 +373,7 @@ mod tests {
         s.vpn.insert("chatgpt".into(), true);
         patch_settings(
             &mut s,
-            &json!({"vpn":{"youtube":true},"volume":300,"radio":false,"wake_reply_enabled":false}),
+            &json!({"vpn":{"youtube":true},"volume":300,"radio":false,"wake_reply_enabled":false,"train_voice_review":true}),
         )
         .unwrap();
         assert_eq!(s.password_hash, "secret");
@@ -380,6 +381,7 @@ mod tests {
         assert_eq!(s.train_limit_mb, 100);
         assert!(s.radio_off);
         assert!(!s.wake_reply_enabled);
+        assert!(s.train_voice_review);
         assert!(s.wake_enabled);
         assert!(s.vpn["chatgpt"] && s.vpn["youtube"]);
         assert!(patch_settings(&mut s, &json!({"password_hash":"replace"})).is_err());

@@ -67,6 +67,7 @@ pub fn categories_json() -> Value {
 /// Инструменты ядра: плагин не может их подменить.
 pub const CORE_TOOLS: &[&str] = &[
     "smart_home", "play_music", "music_control", "alice_command", "recall_conversation", "edit_memory",
+    "switch_profile", "review_current_wake",
     "home_assistant", "xiaomi_home", "smart_life",
 ];
 

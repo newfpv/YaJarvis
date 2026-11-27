@@ -542,6 +542,10 @@ pub(crate) fn platformd_maps() -> Vec<String> {
     out
 }
 
+fn skip_mic_restart(model_id: &str, has_hifi_dsp: bool) -> bool {
+    model_id == "street" || has_hifi_dsp
+}
+
 /// На Midi/Mini Алиса стартует раньше нас со штатным профилем — микрофона нет, пока её не перезапустить.
 pub fn watch_mic(mic: std::sync::Arc<crate::audio::Mic>) {
     std::thread::spawn(move || {
@@ -551,6 +555,14 @@ pub fn watch_mic(mic: std::sync::Arc<crate::audio::Mic>) {
         }
         let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
         if !misses_tap(&mounts, &platformd_maps()) {
+            return;
+        }
+        let model_id = crate::hardware::station_model().id;
+        let has_hifi_dsp = std::path::Path::new("/dev/hifi4dsp0").exists();
+        if skip_mic_restart(model_id, has_hifi_dsp) {
+            log::info!(
+                "микрофон: на колонке с HiFi-DSP ({model_id}) автоперезапуск Алисы отключён, чтобы не нарушать работу dsp_service"
+            );
             return;
         }
         if std::path::Path::new(RESTART_MARK).exists() {
@@ -687,5 +699,13 @@ mod tests {
         vocalize_on(addr, "Длинная фраза", Duration::from_secs(3), || cancelled.load(Ordering::SeqCst)).unwrap();
         server.join().unwrap();
         assert!(got_cancel.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn skip_mic_restart_protects_street_and_hifi_dsp() {
+        assert!(super::skip_mic_restart("street", false));
+        assert!(super::skip_mic_restart("unknown", true));
+        assert!(!super::skip_mic_restart("lite", false));
+        assert!(!super::skip_mic_restart("mini2", false));
     }
 }

@@ -62,20 +62,13 @@ impl Mic {
         }
         #[cfg(target_os = "linux")]
         {
-            if std::path::Path::new("/data/opt/jarvisd/no-mic").exists() {
-                return "отключён файлом no-mic".into();
-            }
+            let no_mic = std::path::Path::new("/data/opt/jarvisd/no-mic").exists();
             let maps = crate::alice::platformd_maps();
-            if maps.iter().any(|m| classify_platformd_maps(m) == "deleted") {
-                return "библиотека микрофона обновилась, перезагрузите колонку".into();
-            }
-            if maps.iter().any(|m| classify_platformd_maps(m) == "missing") {
-                return "перехват микрофона ещё не загружен в систему, перезагрузите колонку".into();
-            }
-            if !maps.is_empty() {
-                return "перехват загружен, но звук не поступает, попробуйте перезагрузить колонку".into();
-            }
+            let model_id = crate::hardware::station_model().id;
+            let has_hifi_dsp = std::path::Path::new("/dev/hifi4dsp0").exists();
+            return why_from_state(no_mic, &maps, model_id, has_hifi_dsp);
         }
+        #[cfg(not(target_os = "linux"))]
         String::new()
     }
 
@@ -320,6 +313,27 @@ pub fn send_wav(sock: &std::path::Path, wav: &std::path::Path) -> std::io::Resul
     Ok(())
 }
 
+/// Причина отсутствия сигнала с микрофона на Linux-колонке по результатам диагностики.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn why_from_state(no_mic: bool, maps: &[String], model_id: &str, has_hifi_dsp: bool) -> String {
+    if no_mic {
+        return "отключён файлом no-mic".into();
+    }
+    if maps.iter().any(|m| classify_platformd_maps(m) == "deleted") {
+        return "библиотека микрофона обновилась, перезагрузите колонку".into();
+    }
+    if model_id == "street" || has_hifi_dsp {
+        return "на Станции Стрит микрофон работает через HiFi-DSP — перехват в разработке (#37)".into();
+    }
+    if maps.iter().any(|m| classify_platformd_maps(m) == "missing") {
+        return "перехват микрофона ещё не загружен в систему, перезагрузите колонку".into();
+    }
+    if !maps.is_empty() {
+        return "перехват загружен, но звук не поступает, попробуйте перезагрузить колонку".into();
+    }
+    String::new()
+}
+
 /// Проверить содержимое /proc/<pid>/maps процесса maind --platformd на наличие vqe_tap.so.
 pub(crate) fn classify_platformd_maps(maps: &str) -> &'static str {
     let mut loaded = false;
@@ -336,7 +350,7 @@ pub(crate) fn classify_platformd_maps(maps: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::classify_platformd_maps;
+    use super::{classify_platformd_maps, why_from_state};
 
     #[test]
     fn detects_vqe_tap_state_in_proc_maps() {
@@ -352,5 +366,31 @@ mod tests {
             classify_platformd_maps("7f8000-7f9000 r-xp 00000000 /system/vendor/quasar/maind\n"),
             "missing"
         );
+    }
+
+    #[test]
+    fn why_from_state_reports_street_and_standard_states() {
+        assert_eq!(why_from_state(true, &[], "street", true), "отключён файлом no-mic");
+        assert_eq!(
+            why_from_state(false, &["7f8000 /data/opt/jarvisd/vqe_tap.so (deleted)\n".into()], "mini2", false),
+            "библиотека микрофона обновилась, перезагрузите колонку"
+        );
+        assert_eq!(
+            why_from_state(false, &["7f8000 /data/opt/jarvisd/vqe_tap.so\n".into()], "street", false),
+            "на Станции Стрит микрофон работает через HiFi-DSP — перехват в разработке (#37)"
+        );
+        assert_eq!(
+            why_from_state(false, &["7f8000 /system/vendor/quasar/maind\n".into()], "unknown", true),
+            "на Станции Стрит микрофон работает через HiFi-DSP — перехват в разработке (#37)"
+        );
+        assert_eq!(
+            why_from_state(false, &["7f8000 /system/vendor/quasar/maind\n".into()], "mini2", false),
+            "перехват микрофона ещё не загружен в систему, перезагрузите колонку"
+        );
+        assert_eq!(
+            why_from_state(false, &["7f8000 /data/opt/jarvisd/vqe_tap.so\n".into()], "lite", false),
+            "перехват загружен, но звук не поступает, попробуйте перезагрузить колонку"
+        );
+        assert_eq!(why_from_state(false, &[], "lite", false), "");
     }
 }

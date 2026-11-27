@@ -381,7 +381,7 @@ impl Setup {
             return Err("Нужен IP вашей колонки в домашней сети".into());
         }
         self.adb(&["connect", &target.to_string()], 10).await?;
-        let info = self.shell(target, r#"id -u; uname -m; head -c 160 /proc/device-tree/model 2>/dev/null | tr -d '\000\n'; printf '\n'; df -k /data 2>/dev/null | awk 'END{print $4}'; awk '/MemTotal/{print $2}' /proc/meminfo; od -An -tu1 -N20 /system/vendor/quasar/maind 2>/dev/null | tr '\n' ' '; printf '\n'; if test -d /etc/init.d && command -v aplay >/dev/null && command -v start-stop-daemon >/dev/null; then echo ready; else echo missing; fi
+        let info = self.shell(target, r#"id -u; uname -m; head -c 160 /proc/device-tree/model 2>/dev/null | tr -d '\000\n'; printf '\n'; df -k /data 2>/dev/null | awk 'END{print $4}'; awk '/MemTotal/{print $2}' /proc/meminfo; { od -An -tu1 -N20 /system/vendor/quasar/maind 2>/dev/null || hexdump -v -n 20 -e '1/1 "%u "' /system/vendor/quasar/maind 2>/dev/null; } | tr '\n' ' '; printf '\n'; m=""; test -d /etc/init.d || m="${m}init.d,"; command -v aplay >/dev/null || m="${m}aplay,"; command -v start-stop-daemon >/dev/null || m="${m}start-stop-daemon,"; if [ -z "$m" ]; then echo ready; else echo "missing:${m%,}"; fi
 d=/data/opt/jarvisd
 if [ -f "$d/jarvisd.prev-rust" ]; then du -k "$d/jarvisd.prev-rust" 2>/dev/null | awk '{print $1}'; else echo 0; fi
 df -k /tmp 2>/dev/null | awk 'END{print $4}'
@@ -394,19 +394,7 @@ for model in wake.bin oww.bin wake_oww.bin; do if [ -e "$d/$model" ]; then echo 
             "armv7l" | "armv8l" => "armv7",
             _ => "",
         };
-        let bytes: Vec<_> = field(5)
-            .split_whitespace()
-            .map_while(|n| n.parse::<u8>().ok())
-            .collect();
-        let userland = if bytes.len() >= 20 && &bytes[..4] == b"\x7fELF" && bytes[5] == 1 {
-            match (bytes[4], u16::from_le_bytes([bytes[18], bytes[19]])) {
-                (1, 40) => "armhf",
-                (2, 183) => "arm64",
-                _ => "",
-            }
-        } else {
-            ""
-        };
+        let userland = parse_elf_userland(field(5));
         let installed = self
             .shell(
                 target,
@@ -443,15 +431,8 @@ for model in wake.bin oww.bin wake_oww.bin; do if [ -e "$d/$model" ]; then echo 
             sp.problems
                 .push("На выбранной колонке нужны разрешённый ADB и root".into());
         }
-        if arch.is_empty()
-            || userland.is_empty()
-            || field(6) != "ready"
-            || !profile.contains("--platformd")
-        {
-            sp.problems.push(
-                "Не подтверждены Linux-прошивка, профиль maind или аудиоинтерфейс колонки".into(),
-            );
-        }
+        sp.problems
+            .extend(detect_compat_problems(field(1), arch, userland, field(6), &profile));
         if sp.problems.is_empty()
             && let Some(dir) = payload_dir().0
             && let Ok(file) = std::fs::File::open(dir.join(format!("station-{}.zip", sp.arch)))
@@ -1496,6 +1477,60 @@ fi"#
     ))
 }
 
+fn parse_elf_userland(raw: &str) -> &'static str {
+    let bytes: Vec<_> = raw
+        .split_whitespace()
+        .map_while(|n| n.parse::<u8>().ok())
+        .collect();
+    if bytes.len() >= 20 && &bytes[..4] == b"\x7fELF" && bytes[5] == 1 {
+        match (bytes[4], u16::from_le_bytes([bytes[18], bytes[19]])) {
+            (1, 40) => "armhf",
+            (2, 183) => "arm64",
+            _ => "",
+        }
+    } else {
+        ""
+    }
+}
+
+fn detect_compat_problems(
+    arch_raw: &str,
+    arch: &str,
+    userland: &str,
+    sys_check: &str,
+    profile: &str,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    if arch.is_empty() {
+        if arch_raw.is_empty() {
+            problems.push("Не удалось определить архитектуру процессора колонки".into());
+        } else {
+            problems.push(format!(
+                "Неподдерживаемая архитектура процессора ({arch_raw}) — нужны armv7 или arm64"
+            ));
+        }
+    }
+    if userland.is_empty() {
+        problems.push(
+            "Не удалось определить ELF-архитектуру /system/vendor/quasar/maind (нужен оригинальный бинарник Алисы и утилита od/hexdump)".into(),
+        );
+    }
+    if sys_check != "ready" {
+        match sys_check.strip_prefix("missing:").filter(|s| !s.is_empty()) {
+            Some(missing) => problems.push(format!(
+                "На колонке не найдены системные компоненты Linux: {missing} (нужны /etc/init.d, aplay и start-stop-daemon)"
+            )),
+            None => problems.push(
+                "На колонке не подтверждены системные компоненты Linux (/etc/init.d, aplay, start-stop-daemon)".into(),
+            ),
+        }
+    }
+    if !profile.contains("--platformd") {
+        problems.push("В /system/vendor/quasar/launch.json не найден профиль maind --platformd".into());
+    }
+    problems
+}
+
 #[cfg(test)]
 mod mic_and_script_tests {
     use super::*;
@@ -1521,5 +1556,37 @@ mod mic_and_script_tests {
         assert!(reboot_reason_for_mic(false, "loaded", Some(false)).is_some());
         assert!(reboot_reason_for_mic(false, "loaded", Some(true)).is_none());
         assert!(reboot_reason_for_mic(false, "loaded", None).is_none());
+    }
+
+    #[test]
+    fn parse_elf_userland_handles_valid_and_invalid_headers() {
+        let armhf = "127 69 76 70 1 1 1 0 0 0 0 0 0 0 0 0 3 0 40 0";
+        let arm64 = "127 69 76 70 2 1 1 0 0 0 0 0 0 0 0 0 3 0 183 0";
+        let script = "35 33 47 98 105 110 47 115 104 10";
+        assert_eq!(parse_elf_userland(armhf), "armhf");
+        assert_eq!(parse_elf_userland(arm64), "arm64");
+        assert_eq!(parse_elf_userland(script), "");
+        assert_eq!(parse_elf_userland(""), "");
+    }
+
+    #[test]
+    fn detect_compat_problems_separates_causes() {
+        assert!(detect_compat_problems("armv7l", "armv7", "armhf", "ready", "--platformd").is_empty());
+
+        let only_maind = detect_compat_problems("aarch64", "arm64", "", "ready", "--platformd");
+        assert_eq!(only_maind.len(), 1);
+        assert!(only_maind[0].contains("maind"));
+
+        let missing_tools = detect_compat_problems("armv7l", "armv7", "armhf", "missing:init.d,aplay", "--platformd");
+        assert_eq!(missing_tools.len(), 1);
+        assert!(missing_tools[0].contains("init.d,aplay"));
+
+        let no_profile = detect_compat_problems("aarch64", "arm64", "arm64", "ready", "--mediad");
+        assert_eq!(no_profile.len(), 1);
+        assert!(no_profile[0].contains("launch.json"));
+
+        let bad_arch = detect_compat_problems("mips", "", "armhf", "ready", "--platformd");
+        assert_eq!(bad_arch.len(), 1);
+        assert!(bad_arch[0].contains("mips"));
     }
 }

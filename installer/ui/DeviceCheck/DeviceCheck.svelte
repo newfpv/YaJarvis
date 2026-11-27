@@ -10,6 +10,9 @@
   let restoreError = $state("");
 
   function checksFor(speaker) {
+    const autostartAndAliceOk = !problems.some((problem) =>
+      /launch\.json|init\.d|start-stop-daemon|aplay|профил/.test(problem),
+    );
     return [
       [speaker.root, "Root-доступ по ADB", speaker.root ? "есть" : "нужна разлоченная колонка"],
       [
@@ -22,7 +25,11 @@
         "Микрофон Алисы",
         speaker.userland ? `библиотека ${speaker.userland}` : "не удалось определить",
       ],
-      [!problems.some((problem) => /профил|init\.d|maind/.test(problem)), "Автозапуск и Алиса", "найдены"],
+      [
+        autostartAndAliceOk,
+        "Автозапуск и Алиса",
+        autostartAndAliceOk ? "найдены" : "не подтверждены",
+      ],
     ];
   }
 

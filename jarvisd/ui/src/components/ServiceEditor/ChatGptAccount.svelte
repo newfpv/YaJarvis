@@ -20,7 +20,7 @@
       {:else if item.status === "access"}<span class="err">Сервис недоступен</span>
       {:else if item.status === "limit"}<span class="note">Последний отказ: лимит</span>{/if}
       <span class="reset-times">
-        {#if usage?.windows}
+        {#if usage?.windows && Object.keys(usage.windows).length > 0}
           {#each windows as [key, label]}
             <span>{label}: {usage.windows[key]?.reset_at ? `сброс ${date(usage.windows[key].reset_at)}` : "срок сброса неизвестен"}</span>
           {/each}

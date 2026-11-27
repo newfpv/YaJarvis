@@ -22,6 +22,10 @@ impl Cache {
         }
         cache.entry(id.into()).or_default().clone()
     }
+    #[cfg(test)]
+    pub(super) async fn backdate(&self, id: &str, secs: i64) {
+        self.entry(id).lock().await.attempted -= secs;
+    }
 }
 fn window(v: &Value, at: i64) -> Option<(String, Value)> {
     let label = match v["limit_window_seconds"].as_i64()? {
@@ -74,11 +78,19 @@ impl ChatGpt {
             .as_str()
             .filter(|s| !s.is_empty())
             .ok_or("Нужен ID аккаунта")?;
+        let force = p["force"].as_bool().unwrap_or(false);
         let slot = self.usage_cache.entry(id);
         let mut entry = slot.lock().await;
         let auth = (self.services)("auth.get".into(), json!({"id":id})).await?;
+        let ttl = if force {
+            5
+        } else if entry.data["error"].is_string() {
+            10
+        } else {
+            60
+        };
         if entry.revision == auth["_revision"]
-            && now() - entry.attempted < 60
+            && now() - entry.attempted < ttl
             && !entry.data.is_null()
         {
             return Ok(entry.data.clone());

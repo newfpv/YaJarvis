@@ -57,6 +57,7 @@ async fn call(network:Value, fallback: bool){
         let services:Callback=Arc::new(move|method,params|{let stats=stats.clone();let events=events.clone();let network=network.clone();Box::pin(async move{match method.as_str(){
             "voice.stats"=>{stats.lock().unwrap().push(params);Ok(Value::Null)},
             "network"=>Ok(network),"auth.get"|"accounts.prepare"=>Ok(json!({"_local_id":"test-account-id","access":"test-access","account":"test-account","refresh":"test-refresh","expires":super::super::now()+3600})),
+            "accounts.ok"=>Ok(Value::Null),
             "voice.event"=>{events.send(params).await.map_err(|e|e.to_string())?;Ok(json!(true))},"voice.brain"=>{assert_eq!(params["task"],"test task");Ok(json!("done"))},_=>Err("unexpected service".into()),
         }})});
         let mut provider=ChatGpt::new(services);let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();provider.call_url=format!("http://{}/call",listener.local_addr().unwrap());
@@ -177,6 +178,7 @@ async fn voice_warm_builds_standby_without_socks_traffic_and_open_consumes_it() 
                 match method.as_str() {
                     "network" => Ok(json!({})),
                     "auth.get" | "accounts.prepare" => Ok(json!({"access":"test-access","account":"test-account","refresh":"test-refresh","expires":super::super::now()+3600})),
+                    "accounts.ok" => Ok(Value::Null),
                     "voice.event" => { events.send(params).await.map_err(|e| e.to_string())?; Ok(json!(true)) }
                     _ => Err("unexpected service".into()),
                 }
@@ -256,6 +258,7 @@ async fn voice_say_waits_for_data_channel_open_after_dtls_connect() {
                 match method.as_str() {
                     "network" => Ok(json!({})),
                     "auth.get" | "accounts.prepare" => Ok(json!({"access":"test-access","account":"test-account","refresh":"test-refresh","expires":super::super::now()+3600})),
+                    "accounts.ok" => Ok(Value::Null),
                     "voice.event" => Ok(json!(true)),
                     _ => Err("unexpected service".into()),
                 }
@@ -331,6 +334,7 @@ async fn rtp_playout_recovers_from_150ms_stall_without_dropping_packets() {
                 match method.as_str() {
                     "network" => Ok(json!({})),
                     "auth.get" | "accounts.prepare" => Ok(json!({"access":"test-access","account":"test-account","refresh":"test-refresh","expires":super::super::now()+3600})),
+                    "accounts.ok" => Ok(Value::Null),
                     "voice.event" => { events.send(params).await.map_err(|e| e.to_string())?; Ok(json!(true)) }
                     _ => Err("unexpected service".into()),
                 }

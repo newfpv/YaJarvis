@@ -57,6 +57,27 @@ impl CoreServices {
             }).map_err(|e|e.to_string())?;
             return Ok(Value::Null);
         }
+        if id == "chatgpt" && method == "accounts.ok" {
+            if !official {
+                return Err("official plugin required".into());
+            }
+            let target_id = params["id"].as_str().unwrap_or("");
+            let needs_clear = self.store.with(|s| {
+                s.chatgpt_accounts
+                    .iter()
+                    .find(|a| a.id == target_id)
+                    .is_some_and(|a| !a.status.is_empty() || a.retry_after != 0)
+            });
+            if needs_clear {
+                self.store
+                    .update(|s| {
+                        crate::chatgpt_accounts::mark_ok(s, target_id);
+                        Ok::<_, std::io::Error>(())
+                    })
+                    .map_err(|e| e.to_string())?;
+            }
+            return Ok(Value::Null);
+        }
         if id == "chatgpt" && matches!(method,"auth.add"|"accounts.prepare"|"accounts.failover"|"accounts.select"|"accounts.remove") {
             if !official { return Err("official plugin required".into()); }
             let mut result=Value::Null;
@@ -323,7 +344,12 @@ mod tests {
         let summary=crate::chatgpt_accounts::summary(&reload.get());assert_eq!(summary["accounts"][0]["live_stats"]["sessions"],1);assert_eq!(summary["accounts"][1]["live_stats"]["sessions"],0);assert_eq!(summary["accounts"][0]["live_stats"]["limit_events"][0]["at"],101);
         assert!(!summary.to_string().contains("fresh"));assert!(!summary.to_string().contains("secret"));
         svc.call("chatgpt","accounts.remove",&json!({"id":old})).unwrap();assert!(svc.call("chatgpt","voice.stats",&p).is_err());
-        svc.official=Box::new(|_|false);assert!(svc.call("chatgpt","voice.stats",&json!({"id":other,"report":p["report"]})).is_err());assert!(svc.call("weather","voice.stats",&p).is_err());
+        let p_fail=json!({"before":store.get().chatgpt,"reason":"limit","retry_s":60,"tried":[]});
+        svc.call("chatgpt","accounts.failover",&p_fail).unwrap();
+        assert_eq!(store.get().chatgpt_accounts[0].status,"limit");
+        svc.call("chatgpt","accounts.ok",&json!({"id":other})).unwrap();
+        assert!(store.get().chatgpt_accounts[0].status.is_empty());
+        svc.official=Box::new(|_|false);assert!(svc.call("chatgpt","voice.stats",&json!({"id":other,"report":p["report"]})).is_err());assert!(svc.call("chatgpt","accounts.ok",&json!({"id":other})).is_err());assert!(svc.call("weather","voice.stats",&p).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

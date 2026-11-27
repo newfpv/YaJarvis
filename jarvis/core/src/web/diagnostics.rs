@@ -130,6 +130,11 @@ fn collect_secrets(s: &crate::settings::Settings) -> Vec<String> {
         if let Some(val) = s.chatgpt.get(field).and_then(Value::as_str) {
             push_secret(&mut set, val);
         }
+        for account in &s.chatgpt_accounts {
+            if let Some(val) = account.auth.get(field).and_then(Value::as_str) {
+                push_secret(&mut set, val);
+            }
+        }
     }
     for field in ["ssecurity", "service_token", "passToken"] {
         if let Some(val) = s.xiaomi.get(field).and_then(Value::as_str) {
@@ -599,6 +604,18 @@ mod tests {
         s.password_hash = "$2b$12$verysecrethashvalue".into();
         s.home_assistant = json!({"url": "http://192.168.1.10:8123", "token": "ha-long-token-987654"});
         s.chatgpt = json!({"email": "user@example.com", "refresh": "rt_secret_refresh_123"});
+        s.chatgpt_accounts.push(crate::chatgpt_accounts::Account {
+            id: "acc2".into(),
+            auth: json!({
+                "email": "backup@example.com",
+                "refresh": "rt_inactive_secret_456",
+                "access": "at_inactive_789",
+                "id_token": "idt_inactive_000"
+            }),
+            live: Default::default(),
+            status: String::new(),
+            retry_after: 0,
+        });
         let extras = collect_secrets(&s);
 
         let sample = concat!(
@@ -608,6 +625,7 @@ mod tests {
             "Cookie: sid=topsecret; theme=dark\n",
             "openai sk-proj-secret123 grok xai-secret999 ",
             "ha=ha-long-token-987654 email=user@example.com ",
+            "inactive=backup@example.com tok=rt_inactive_secret_456 acc=at_inactive_789 idt=idt_inactive_000 ",
             "hash=$2b$12$verysecrethashvalue refresh_token=tok_xyz777"
         );
         let red = redact_secrets(sample, &extras);
@@ -621,6 +639,10 @@ mod tests {
             "xai-secret999",
             "ha-long-token-987654",
             "user@example.com",
+            "backup@example.com",
+            "rt_inactive_secret_456",
+            "at_inactive_789",
+            "idt_inactive_000",
             "verysecrethashvalue",
             "tok_xyz777",
         ] {

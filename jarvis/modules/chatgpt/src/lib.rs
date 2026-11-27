@@ -131,7 +131,10 @@ impl ChatGpt {
                 }
             }
             match result{
-                Ok(voice)=>return Ok(voice),
+                Ok(voice)=>{
+                    let _=(self.services)("accounts.ok".into(),json!({"id":used["_local_id"]})).await;
+                    return Ok(voice);
+                }
                 Err(e)=>{self.account_failure(used,&e,&tried).await?;}
             }
         }
@@ -208,6 +211,7 @@ impl ChatGpt {
                 let client=self.client().await?;
                 let response=client.post(&self.codex).bearer_auth(access).header("chatgpt-account-id",account).header("Accept","text/event-stream").header("OpenAI-Beta","responses=experimental").header("originator","codex_cli_rs").header("session_id",session).json(&params["body"]).send().await.map_err(|e|net_error("Нет соединения с ChatGPT",&e))?;
                 if response.status().is_success(){
+                    let _=(self.services)("accounts.ok".into(),json!({"id":auth["_local_id"]})).await;
                     // Never replay a request after streamed output/tool calls have started.
                     return sse(response).await;
                 }
@@ -293,7 +297,7 @@ async fn sse(mut response:reqwest::Response)->Result<Value,String>{
 #[cfg(test)]mod tests{
     use super::*;use tokio::io::{AsyncReadExt,AsyncWriteExt};
     fn jwt(claim:Value)->String{format!("e30.{}.signature",URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claim).unwrap()))}
-    fn services(auth:Arc<Mutex<Value>>)->Callback{Arc::new(move|method,params|{let auth=auth.clone();Box::pin(async move{match method.as_str(){"network"=>Ok(json!({})),"auth.get"|"accounts.prepare"=>Ok(auth.lock().unwrap().clone()),"auth.set"=>{let mut current=auth.lock().unwrap();if *current!=params["before"]{return Err("account changed".into());}*current=params["after"].clone();Ok(json!(true))},_=>Err("unknown service".into())}})})}
+    fn services(auth:Arc<Mutex<Value>>)->Callback{Arc::new(move|method,params|{let auth=auth.clone();Box::pin(async move{match method.as_str(){"network"=>Ok(json!({})),"auth.get"|"accounts.prepare"=>Ok(auth.lock().unwrap().clone()),"accounts.ok"=>Ok(Value::Null),"auth.set"=>{let mut current=auth.lock().unwrap();if *current!=params["before"]{return Err("account changed".into());}*current=params["after"].clone();Ok(json!(true))},_=>Err("unknown service".into())}})})}
     #[tokio::test]
     async fn refresh_serializes_and_commits_rotated_tokens_atomically(){
         let auth=Arc::new(Mutex::new(json!({"refresh":"old-refresh","account":"account","access":"expired","expires":0})));

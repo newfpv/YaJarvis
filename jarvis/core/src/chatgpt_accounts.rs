@@ -201,6 +201,17 @@ pub fn failover(s: &mut Settings, p: &Value) -> Result<Value, String> {
     }
     Ok(json!({"switched":false}))
 }
+pub fn mark_ok(s: &mut Settings, id: &str) -> bool {
+    let Some(a) = s.chatgpt_accounts.iter_mut().find(|a| a.id == id) else {
+        return false;
+    };
+    if a.status.is_empty() && a.retry_after == 0 {
+        return false;
+    }
+    a.status.clear();
+    a.retry_after = 0;
+    true
+}
 
 #[cfg(test)]
 mod tests {
@@ -312,5 +323,17 @@ mod tests {
         s.chatgpt_accounts[0].retry_after = now() - 1;
         assert!(prepare(&mut s).is_ok());
         assert_eq!(summary(&s)["accounts"][0]["status"], "limit");
+    }
+    #[test]
+    fn mark_ok_clears_limit_status_after_confirmed_success() {
+        let mut s = Settings::default();
+        add(&mut s, auth("a")).unwrap();
+        let id = s.chatgpt_active.clone();
+        assert!(!mark_ok(&mut s, &id));
+        s.chatgpt_accounts[0].status = "limit".into();
+        s.chatgpt_accounts[0].retry_after = now() + 60;
+        assert!(mark_ok(&mut s, &id));
+        assert_eq!(summary(&s)["accounts"][0]["status"], "ready");
+        assert!(!mark_ok(&mut s, &id));
     }
 }

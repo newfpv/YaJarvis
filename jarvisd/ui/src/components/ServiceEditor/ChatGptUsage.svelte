@@ -1,3 +1,23 @@
+<script module>
+  const MAX_CONCURRENT_USAGE = 2;
+  let activeUsage = 0;
+  const usageQueue = [];
+  function enqueueUsage(fn) {
+    return new Promise((resolve, reject) => {
+      const run = async () => {
+        activeUsage++;
+        try { resolve(await fn()); }
+        catch (e) { reject(e); }
+        finally {
+          activeUsage--;
+          if (usageQueue.length) usageQueue.shift()();
+        }
+      };
+      if (activeUsage < MAX_CONCURRENT_USAGE) run();
+      else usageQueue.push(run);
+    });
+  }
+</script>
 <script>
   import { onMount } from "svelte";
   import { api } from "#helpers/core.js";
@@ -8,11 +28,11 @@
   const windows = [["five_hour", "5 часов"], ["weekly", "Неделя"]];
   const percent = (value) => new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 1 }).format(value);
   const date = (value) => new Date(value * 1000).toLocaleString("ru-RU", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
-  async function refresh() {
+  async function refresh(force = false) {
     if (loading) return;
     loading = true;
     try {
-      const result = await api("POST", "/api/chatgpt/usage", {id: accountId});
+      const result = await enqueueUsage(() => api("POST", "/api/chatgpt/usage", { id: accountId, force }));
       if (alive) { usage = result.usage; error = usage.error || ""; }
     } catch (e) {
       if (alive) {
@@ -23,13 +43,13 @@
     finally { if (alive) loading = false; }
   }
   onMount(() => {
-    refresh();
-    const timer = setInterval(() => { if (!document.hidden) refresh(); }, 60000);
+    refresh(false);
+    const timer = setInterval(() => { if (!document.hidden) refresh(false); }, 60000);
     return () => { alive = false; clearInterval(timer); };
   });
 </script>
 <div class="quota" aria-label="Лимиты Codex">
-  <div class="quota-title"><b>Лимиты Codex</b><button type="button" class="btn sm" disabled={loading} onclick={refresh}>{loading ? "Проверяю…" : "Обновить лимиты"}</button></div>
+  <div class="quota-title"><b>Лимиты Codex</b><button type="button" class="btn sm" disabled={loading} onclick={() => refresh(true)}>{loading ? "Проверяю…" : "Обновить лимиты"}</button></div>
   {#each windows as [key, label]}
     {@const item = usage?.windows?.[key]}
     <div class="quota-window">

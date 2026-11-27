@@ -14,6 +14,7 @@ fn host(auto: bool) -> (Callback, Arc<Mutex<(Value, usize)>>) {
             match method.as_str() {
                 "network" => Ok(json!({})),
                 "auth.get" | "accounts.prepare" => Ok(s.0.clone()),
+                "accounts.ok" => Ok(Value::Null),
                 "auth.set" => {
                     assert_eq!(s.0, p["before"]);
                     s.0 = p["after"].clone();
@@ -252,5 +253,60 @@ async fn usage_reads_inactive_account_and_coalesces_requests_without_switching()
     assert_eq!(a["windows"]["five_hour"]["remaining_percent"], 75.0);
     assert_eq!(a["windows"]["weekly"]["remaining_percent"], 60.0);
     assert!(!a.to_string().contains("token-b"));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn usage_force_refreshes_cache_and_errors_expire_quickly() {
+    let cb: Callback = Arc::new(move |method, _| {
+        Box::pin(async move {
+            match method.as_str() {
+                "network" => Ok(json!({})),
+                "auth.get" => Ok(saved("b")),
+                _ => Err(format!("unexpected {method}")),
+            }
+        })
+    });
+    let mut provider = ChatGpt::new(cb);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    provider.usage_url = format!("http://{}/usage", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        reply(&listener, 500, "{}").await;
+        reply(
+            &listener,
+            200,
+            r#"{"rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000}}}"#,
+        )
+        .await;
+        reply(
+            &listener,
+            200,
+            r#"{"rate_limit":{"primary_window":{"used_percent":35,"limit_window_seconds":18000}}}"#,
+        )
+        .await;
+    });
+
+    let err_res = provider.request("accounts.usage", json!({"id":"b"})).await.unwrap();
+    assert!(err_res["error"].as_str().is_some());
+
+    provider.usage_cache.backdate("b", 6).await;
+    let cached_err = provider.request("accounts.usage", json!({"id":"b"})).await.unwrap();
+    assert!(cached_err["error"].as_str().is_some());
+
+    let forced_ok = provider
+        .request("accounts.usage", json!({"id":"b","force":true}))
+        .await
+        .unwrap();
+    assert_eq!(forced_ok["windows"]["five_hour"]["remaining_percent"], 90.0);
+
+    provider.usage_cache.backdate("b", 20).await;
+    let still_cached = provider.request("accounts.usage", json!({"id":"b"})).await.unwrap();
+    assert_eq!(still_cached["windows"]["five_hour"]["remaining_percent"], 90.0);
+
+    let refreshed = provider
+        .request("accounts.usage", json!({"id":"b","force":true}))
+        .await
+        .unwrap();
+    assert_eq!(refreshed["windows"]["five_hour"]["remaining_percent"], 65.0);
     server.await.unwrap();
 }

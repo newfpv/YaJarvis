@@ -1,6 +1,7 @@
 <script>
   import { icon, tip } from "#helpers/core.js";
   import VpnSwitch from "./VpnSwitch.svelte";
+  import ChatGptAccount from "./ChatGptAccount.svelte";
 
   let { id, state, action, keydown } = $props();
   let account = $derived(state[id] || {});
@@ -18,24 +19,25 @@
 </script>
 
 {#if id === "chatgpt"}
-  {#if account.signed_in}
-    <div class="cn-ok">{@html icon("done")}<span>Колонка вошла в ChatGPT{#if account.plan} · <b>{account.plan}</b>{/if}{#if account.email}<small>{account.email}</small>{/if}</span></div>
-    {#if account.limited_until * 1000 > Date.now()}
-      <p class="err">Кончился лимит голоса в подписке. До {new Date(account.limited_until * 1000).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })} Джарвис говорит через Gemini{state.keys?.gemini ? "" : " — но ключа Gemini нет, добавьте его ниже"}.</p>
-    {/if}
-    <p class="note">Все звонки — один разговор с общей памятью. Что Джарвис помнит, видно и правится на странице <a class="lnk" href="/memory">«Память»</a>.</p>
-  {:else if login.code}
+  <div class="cg-accounts">
+    {#each account.accounts || [] as item, index (item.id)}
+      <ChatGptAccount {item} {index} {action} />
+    {/each}
+  </div>
+  <label class="sw"><input type="checkbox" id="cg-auto" checked={Boolean(account.auto_switch)} onchange={action}><span class="tr"></span>Автоматически переключать аккаунт</label>
+  <p class="note">При подтверждённом лимите или недействительном входе пробовать следующий доступный аккаунт. Сетевая ошибка не переключает аккаунты. Порядок — как в списке.</p>
+  {#if login.code}
     <ol class="how cn-steps">
-      <li>Откройте <a href={login.url} target="_blank" rel="noopener">{login.url?.replace("https://", "")}</a> (из России и Беларуси — через VPN) и войдите в свой ChatGPT.</li>
+      <li>Откройте <a href={login.url} target="_blank" rel="noopener">{login.url?.replace("https://", "")}</a> и выберите нужный аккаунт ChatGPT.</li>
       <li>Введите код: <b class="code-big">{login.code}</b></li>
-      <li>Это окно само увидит вход — ничего нажимать не нужно.</li>
+      <li>После входа аккаунт появится здесь. Уже добавленные сохранятся.</li>
     </ol>
   {:else}
     {#if login.error}<p class="err">{login.error}</p>{/if}
-    <div class="row"><button type="button" class="btn primary" id="cg-in" onclick={action}>Войти в ChatGPT</button></div>
-    <p class="note">Колонка получит свой вход, пароль она не видит. Способ неофициальный, как у Codex: OpenAI может его изменить.</p>
-    <VpnSwitch {id} {state} {action} />
+    <div class="row"><button type="button" class="btn primary" id="cg-in" onclick={action}>Добавить аккаунт</button></div>
   {/if}
+  <p class="note">Повторный вход в тот же аккаунт обновляет его авторизацию. Переключение закрывает текущий разговор. Локальная память колонки общая; облачные сессии разделены по аккаунтам.</p>
+  <VpnSwitch {id} {state} {action} />
 {:else if id === "youtube"}
   {#if youtube.code}
     <div class="ycode">
@@ -133,3 +135,7 @@
   {/if}
   <VpnSwitch {id} {state} {action} />
 {/if}
+
+<style>
+.cg-accounts {display:grid;gap:8px;margin-bottom:18px}
+</style>

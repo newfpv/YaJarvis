@@ -51,7 +51,7 @@ export function connDefs() {
     { id: "chatgpt", plugin: "", group: "voice", mono: "GP", name: "Подписка ChatGPT",
       about: "Голос Джарвиса за счёт подписки Plus или Pro — без оплаты API за минуты",
       more: "Включается у ассистента: движок «GPT-Live по подписке».",
-      on: Boolean(chatgpt.signed_in), wait: !chatgpt.signed_in && Boolean(chatgpt.login?.code),
+      on: Boolean(chatgpt.signed_in), wait: Boolean(chatgpt.login?.code),
       state: chatgpt.signed_in ? ["вход выполнен", chatgpt.plan].filter(Boolean).join(" · ")
         : chatgpt.login?.code ? "ждёт код" : "не подключено" },
     key("openai", { mono: "AI", name: "OpenAI", place: "sk-…", about: "Голос и «мозг» Джарвиса. Живой разговор — примерно 5 центов в минуту" }),
@@ -381,6 +381,18 @@ export async function serviceAction(t, root, redraw) {
     try { await api("PUT", "/api/settings", { vpn: { [svc]: on } }); delete CONN.net[svc]; await redraw(); toast(`${VPN_NAMES.find(([id]) => id === svc)?.[1] || svc}: ${on ? "через VPN" : "напрямую"}`); }
     catch (err) { t.checked = !on; toast(err.message, true); }
     return;
+  }
+  if (t.id === "cg-auto") {
+    const enabled = t.checked;
+    try { await api("POST", "/api/chatgpt/accounts", {action:"auto", enabled}); await redraw(); }
+    catch(error) { t.checked = !enabled; toast(error.message, true); }
+    return;
+  }
+  const cg = t.closest("[data-cg-select], [data-cg-remove]");
+  if (cg) {
+    const removing = cg.dataset.cgRemove !== undefined;
+    if (removing && !confirm("Удалить этот аккаунт с колонки? Остальные сохранятся.")) return;
+    return act(cg, async () => { await api("POST", "/api/chatgpt/accounts", {action:removing ? "remove":"select", id:removing ? cg.dataset.cgRemove:cg.dataset.cgSelect}); await redraw(); }, removing ? "Аккаунт удалён":"Аккаунт выбран");
   }
   const gk = t.closest("[data-gk-remove], [data-gk-reset], [data-gk-reset-all], [data-gk-activate]");
   if (gk) {

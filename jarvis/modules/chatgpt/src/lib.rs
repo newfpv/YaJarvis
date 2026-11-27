@@ -10,17 +10,20 @@ mod mic;
 mod rtc_runtime;
 mod rtc_udp;
 mod rtc_voice;
+mod account_error;
+mod usage;
+mod live_stats;
 fn now()->i64{SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64}
 pub struct ChatGpt {
-    services:Callback,refresh:tokio::sync::Mutex<()>,login:Arc<Mutex<Value>>,
+    services:Callback,account_admin:Arc<tokio::sync::Mutex<()>>,refresh:tokio::sync::Mutex<()>,login:Arc<Mutex<Value>>,
     generation:Arc<std::sync::atomic::AtomicU64>,poller:Mutex<Option<tokio::task::JoinHandle<()>>>,
-    issuer:String,codex:String,call_url:String,
+    issuer:String,codex:String,call_url:String,usage_url:String,usage_cache:usage::Cache,
     client_cache:Mutex<Option<(Value,reqwest::Client)>>,
     standby:Mutex<Option<rtc_voice::StandbyPeer>>,standby_lock:tokio::sync::Mutex<()>,
     voices:Mutex<std::collections::BTreeMap<String,Arc<rtc_voice::RtcVoice>>>,voice_lock:tokio::sync::Mutex<()>,
 }
 impl ChatGpt {
-    pub fn new(services:Callback)->Self{Self{services,refresh:tokio::sync::Mutex::new(()),login:Arc::new(Mutex::new(Value::Null)),generation:Arc::new(std::sync::atomic::AtomicU64::new(0)),poller:Mutex::new(None),issuer:ISSUER.into(),codex:"https://chatgpt.com/backend-api/codex/responses".into(),call_url:"https://chatgpt.com/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas".into(),client_cache:Mutex::default(),standby:Mutex::default(),standby_lock:tokio::sync::Mutex::new(()),voices:Mutex::default(),voice_lock:tokio::sync::Mutex::new(())}}
+    pub fn new(services:Callback)->Self{Self{services,account_admin:Arc::new(tokio::sync::Mutex::new(())),refresh:tokio::sync::Mutex::new(()),login:Arc::new(Mutex::new(Value::Null)),generation:Arc::new(std::sync::atomic::AtomicU64::new(0)),poller:Mutex::new(None),usage_url:"https://chatgpt.com/backend-api/wham/usage".into(),usage_cache:usage::Cache::default(),issuer:ISSUER.into(),codex:"https://chatgpt.com/backend-api/codex/responses".into(),call_url:"https://chatgpt.com/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas".into(),client_cache:Mutex::default(),standby:Mutex::default(),standby_lock:tokio::sync::Mutex::new(()),voices:Mutex::default(),voice_lock:tokio::sync::Mutex::new(())}}
     async fn client(&self)->Result<reqwest::Client,String>{self.client_for(&(self.services)("network".into(),json!({})).await?)}
     fn client_for(&self,network:&Value)->Result<reqwest::Client,String>{
         if let Some(error)=network["error"].as_str(){return Err(error.into());}
@@ -66,10 +69,12 @@ impl ChatGpt {
     pub async fn shutdown(&self){let voices=std::mem::take(&mut*self.voices.lock().unwrap());let standby=self.standby.lock().unwrap().take();self.stop();for (_,voice) in voices{voice.close().await;}if let Some(peer)=standby{peer.close().await;}}
     pub async fn request(&self,method:&str,params:Value)->Result<Value,String>{
         match method{
-            "auth.token"=>Box::pin(self.token()).await,
+            "auth.token"=>Box::pin(self.token_available()).await,
+            "accounts.usage"=>Box::pin(self.account_usage(&params)).await,
             "login.status"=>Ok(self.login_state()),
-            "login.start"=>Box::pin(self.start()).await,
-            "auth.logout"=>{self.stop();let before=(self.services)("auth.get".into(),Value::Null).await?;(self.services)("auth.set".into(),json!({"before":before,"after":{}})).await?;Ok(json!({}))},
+            "login.start"=>{let _lock=self.voice_lock.lock().await;let _admin=self.account_admin.lock().await;Box::pin(self.start()).await},
+            "accounts.select"|"accounts.remove"=>{let _lock=self.voice_lock.lock().await;let _admin=self.account_admin.lock().await;self.shutdown().await;(self.services)(method.into(),params).await},
+            "auth.logout"=>{let _lock=self.voice_lock.lock().await;let _admin=self.account_admin.lock().await;self.shutdown().await;let before=(self.services)("auth.get".into(),Value::Null).await?;(self.services)("accounts.remove".into(),json!({"id":before["_local_id"]})).await?;Ok(json!({}))},
             "codex.request"=>Box::pin(self.codex(params)).await,
             "voice.warm"=>Box::pin(async move {
                 let auth=(self.services)("auth.get".into(),Value::Null).await?;
@@ -92,7 +97,7 @@ impl ChatGpt {
                 let _lock=self.voice_lock.lock().await;let id=params["id"].as_str().ok_or("Нужен ID звонка")?;
                 if self.voices.lock().unwrap().contains_key(id){return Ok(json!({"rate":48000}));}
                 if self.voices.lock().unwrap().len()>=2{return Err("Лимит: два звонка ChatGPT".into());}
-                let generation=self.generation.load(std::sync::atomic::Ordering::SeqCst);let voice=Box::pin(rtc_voice::RtcVoice::open(self,&params)).await?;
+                let generation=self.generation.load(std::sync::atomic::Ordering::SeqCst);let voice=Box::pin(self.open_with_failover(&params,generation)).await?;
                 if generation!=self.generation.load(std::sync::atomic::Ordering::SeqCst){voice.close().await;return Err("Звонок отменён".into());}
                 let model=voice.requested_model;
                 self.voices.lock().unwrap().insert(voice.id.clone(),voice);Ok::<Value,String>(json!({"rate":48000,"requested_model":model}))
@@ -104,16 +109,58 @@ impl ChatGpt {
         }
     }
     fn voice(&self,params:&Value)->Result<Arc<rtc_voice::RtcVoice>,String>{self.voices.lock().unwrap().get(params["id"].as_str().unwrap_or("")).cloned().ok_or("Звонок ChatGPT закрыт".into())}
+    async fn account_failure(&self,before:Value,error:&str,tried:&[Value])->Result<bool,String>{
+        let Some(f)=account_error::Failure::parse(error)else{return Err(error.into())};
+        let result=(self.services)("accounts.failover".into(),json!({"before":before,"reason":f.reason,"retry_s":f.retry,"tried":tried})).await?;
+        if result["switched"]==true{Ok(true)}else{Err(f.message())}
+    }
+    async fn open_with_failover(&self,params:&Value,generation:u64)->Result<Arc<rtc_voice::RtcVoice>,String>{
+        (self.services)("accounts.prepare".into(),Value::Null).await?;
+        let mut tried=Vec::new();
+        for _ in 0..8{
+            if generation!=self.generation.load(std::sync::atomic::Ordering::SeqCst){return Err("Разговор отменён".into())}
+            let before=(self.services)("auth.get".into(),Value::Null).await?;
+            tried.push(before["_local_id"].clone());
+            let auth=match self.token().await{Ok(a)=>a,Err(e)=>{self.account_failure(before,&e,&tried).await?;continue}};
+            let mut result=rtc_voice::RtcVoice::open_auth(self,params,auth.clone()).await;
+            let mut used=auth;
+            if result.as_ref().err().and_then(|e|account_error::Failure::parse(e)).is_some_and(|f|f.reason=="auth"){
+                match self.token_with_margin(i64::MAX/2).await{
+                    Ok(fresh)=>{used=fresh;result=rtc_voice::RtcVoice::open_auth(self,params,used.clone()).await;},
+                    Err(e)=>result=Err(e),
+                }
+            }
+            match result{
+                Ok(voice)=>return Ok(voice),
+                Err(e)=>{self.account_failure(used,&e,&tried).await?;}
+            }
+        }
+        Err("Все сохранённые аккаунты ChatGPT проверены; доступных нет".into())
+    }
+    async fn token_available(&self)->Result<Value,String>{
+        (self.services)("accounts.prepare".into(),Value::Null).await?;
+        let mut tried=Vec::new();
+        for _ in 0..8 {
+            let before=(self.services)("auth.get".into(),Value::Null).await?;
+            tried.push(before["_local_id"].clone());
+            match self.token().await { Ok(a)=>return Ok(a), Err(e)=>{self.account_failure(before,&e,&tried).await?;} }
+        }
+        Err("Нет доступного входа ChatGPT".into())
+    }
     async fn token(&self)->Result<Value,String>{self.token_with_margin(300).await}
-    async fn token_with_margin(&self,margin_secs:i64)->Result<Value,String>{
-        let _lock=self.refresh.lock().await;let before=(self.services)("auth.get".into(),Value::Null).await?;
+    async fn token_with_margin(&self,margin_secs:i64)->Result<Value,String>{self.token_for(None,margin_secs).await}
+    async fn token_for(&self,id:Option<&str>,margin_secs:i64)->Result<Value,String>{
+        let _lock=self.refresh.lock().await;
+        let _admin=self.account_admin.lock().await;
+        let before=(self.services)("auth.get".into(),id.map(|id|json!({"id":id})).unwrap_or(Value::Null)).await?;
         let get=|k:&str|before[k].as_str().unwrap_or("");
         if get("refresh").is_empty() || get("account").is_empty(){return Err("Не выполнен вход в ChatGPT".into());}
         if !get("access").is_empty() && before["expires"].as_i64().unwrap_or(0)>now()+margin_secs{return Ok(before);}
         let client=self.client().await?;
-        let response=client.post(format!("{}/oauth/token",self.issuer)).form(&[("grant_type","refresh_token"),("refresh_token",get("refresh")),("client_id",CLIENT),("scope","openid profile email")]).send().await.map_err(|e|net_error("Не продлить вход в ChatGPT",&e))?;
+        let response=client.post(format!("{}/oauth/token",self.issuer)).timeout(Duration::from_secs(10)).form(&[("grant_type","refresh_token"),("refresh_token",get("refresh")),("client_id",CLIENT),("scope","openid profile email")]).send().await.map_err(|e|net_error("Не продлить вход в ChatGPT",&e))?;
+        if !response.status().is_success(){return Err(account_error::rejected(response).await);}
         let tokens=json_response(response).await?;let after=tokens_to_auth(&tokens,&before)?;
-        (self.services)("auth.set".into(),json!({"before":before,"after":after})).await?;Ok(after)
+        (self.services)("auth.set".into(),json!({"id":id,"before":before,"after":after})).await?;Ok(after)
     }
     async fn start(&self)->Result<Value,String>{
         self.stop();let http=self.client().await?;
@@ -122,8 +169,7 @@ impl ChatGpt {
         let code=device["user_code"].as_str().or_else(||device["usercode"].as_str()).ok_or("OpenAI не выдал код")?.to_string();
         let interval=device["interval"].as_u64().or_else(||device["interval"].as_str().and_then(|v|v.parse().ok())).unwrap_or(5).clamp(1,30);
         let state=json!({"code":code,"url":format!("{}/codex/device",self.issuer),"until":now()+900});*self.login.lock().unwrap()=state.clone();
-        let before=(self.services)("auth.get".into(),Value::Null).await?;
-        let generation=self.generation.load(std::sync::atomic::Ordering::SeqCst);let serial=self.generation.clone();let services=self.services.clone();let login=self.login.clone();let issuer=self.issuer.clone();
+        let generation=self.generation.load(std::sync::atomic::Ordering::SeqCst);let serial=self.generation.clone();let services=self.services.clone();let login=self.login.clone();let issuer=self.issuer.clone();let admin=self.account_admin.clone();
         let task=tokio::spawn(async move{
             let result=async{
                 let until=tokio::time::Instant::now()+Duration::from_secs(900);
@@ -137,8 +183,9 @@ impl ChatGpt {
                     let verifier=grant["code_verifier"].as_str().ok_or("OpenAI не выдал verifier")?;
                     let response=http.post(format!("{issuer}/oauth/token")).form(&[("grant_type","authorization_code"),("code",code),("client_id",CLIENT),("redirect_uri",&format!("{issuer}/deviceauth/callback")),("code_verifier",verifier)]).send().await.map_err(|e|net_error("Не обменять код ChatGPT",&e))?;
                     let after=tokens_to_auth(&json_response(response).await?,&json!({}))?;
+                    let _admin=admin.lock().await;
                     if serial.load(std::sync::atomic::Ordering::SeqCst)!=generation{return Ok(());}
-                    (services)("auth.set".into(),json!({"before":before,"after":after})).await?;*login.lock().unwrap()=Value::Null;return Ok(());
+                    (services)("auth.add".into(),json!({"after":after})).await?;*login.lock().unwrap()=Value::Null;return Ok(());
                 }
                 Err::<(),String>("Код ChatGPT устарел; начните вход заново".into())
             }.await;
@@ -146,12 +193,35 @@ impl ChatGpt {
         });*self.poller.lock().unwrap()=Some(task);Ok(state)
     }
     async fn codex(&self,params:Value)->Result<Value,String>{
-        let auth=self.token().await?;let access=auth["access"].as_str().ok_or("Нет токена ChatGPT")?;let account=auth["account"].as_str().ok_or("Нет аккаунта ChatGPT")?;
-        let session=params["session"].as_str().unwrap_or("");if session.len()>128{return Err("Неверный ID сессии".into());}
-        let client=self.client().await?;let response=client.post(&self.codex).bearer_auth(access).header("chatgpt-account-id",account).header("Accept","text/event-stream").header("OpenAI-Beta","responses=experimental").header("originator","codex_cli_rs").header("session_id",session).json(&params["body"]).send().await.map_err(|e|net_error("Нет соединения с ChatGPT",&e))?;
-        if !response.status().is_success(){return Err(format!("ChatGPT ответил {}",response.status().as_u16()));}
-        sse(response).await
+        let generation=self.generation.load(std::sync::atomic::Ordering::SeqCst);
+        (self.services)("accounts.prepare".into(),Value::Null).await?;
+        let mut tried=Vec::new();
+        for _ in 0..8 {
+            if generation!=self.generation.load(std::sync::atomic::Ordering::SeqCst){return Err("Запрос отменён при смене аккаунта".into())}
+            let before=(self.services)("auth.get".into(),Value::Null).await?;
+            tried.push(before["_local_id"].clone());
+            let mut auth=match self.token().await{Ok(a)=>a,Err(e)=>{self.account_failure(before,&e,&tried).await?;continue}};
+            for attempt in 0..2 {
+                let access=auth["access"].as_str().ok_or("Нет токена ChatGPT")?;
+                let account=auth["account"].as_str().ok_or("Нет аккаунта ChatGPT")?;
+                let session=format!("{}-{}",auth["_local_id"].as_str().unwrap_or("legacy"),params["session"].as_str().unwrap_or("").chars().take(90).collect::<String>());
+                let client=self.client().await?;
+                let response=client.post(&self.codex).bearer_auth(access).header("chatgpt-account-id",account).header("Accept","text/event-stream").header("OpenAI-Beta","responses=experimental").header("originator","codex_cli_rs").header("session_id",session).json(&params["body"]).send().await.map_err(|e|net_error("Нет соединения с ChatGPT",&e))?;
+                if response.status().is_success(){
+                    // Never replay a request after streamed output/tool calls have started.
+                    return sse(response).await;
+                }
+                let mut error=account_error::rejected(response).await;
+                if attempt==0 && account_error::Failure::parse(&error).is_some_and(|f|f.reason=="auth") {
+                    match self.token_with_margin(i64::MAX/2).await {Ok(fresh)=>{auth=fresh;continue},Err(e)=>error=e}
+                }
+                self.account_failure(auth,&error,&tried).await?;
+                break;
+            }
+        }
+        Err("Все сохранённые аккаунты ChatGPT недоступны".into())
     }
+
 }
 impl Drop for ChatGpt{fn drop(&mut self){self.stop();}}
 fn classify_net_error(is_timeout:bool,is_connect:bool,detail:&str)->&'static str{
@@ -223,7 +293,7 @@ async fn sse(mut response:reqwest::Response)->Result<Value,String>{
 #[cfg(test)]mod tests{
     use super::*;use tokio::io::{AsyncReadExt,AsyncWriteExt};
     fn jwt(claim:Value)->String{format!("e30.{}.signature",URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claim).unwrap()))}
-    fn services(auth:Arc<Mutex<Value>>)->Callback{Arc::new(move|method,params|{let auth=auth.clone();Box::pin(async move{match method.as_str(){"network"=>Ok(json!({})),"auth.get"=>Ok(auth.lock().unwrap().clone()),"auth.set"=>{let mut current=auth.lock().unwrap();if *current!=params["before"]{return Err("account changed".into());}*current=params["after"].clone();Ok(json!(true))},_=>Err("unknown service".into())}})})}
+    fn services(auth:Arc<Mutex<Value>>)->Callback{Arc::new(move|method,params|{let auth=auth.clone();Box::pin(async move{match method.as_str(){"network"=>Ok(json!({})),"auth.get"|"accounts.prepare"=>Ok(auth.lock().unwrap().clone()),"auth.set"=>{let mut current=auth.lock().unwrap();if *current!=params["before"]{return Err("account changed".into());}*current=params["after"].clone();Ok(json!(true))},_=>Err("unknown service".into())}})})}
     #[tokio::test]
     async fn refresh_serializes_and_commits_rotated_tokens_atomically(){
         let auth=Arc::new(Mutex::new(json!({"refresh":"old-refresh","account":"account","access":"expired","expires":0})));
@@ -260,3 +330,5 @@ async fn sse(mut response:reqwest::Response)->Result<Value,String>{
         assert_eq!(classify_net_error(false,false,"unexpected eof"),"сетевая ошибка");
     }
 }
+
+#[cfg(test)] mod accounts_tests;

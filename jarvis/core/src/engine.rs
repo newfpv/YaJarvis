@@ -1265,7 +1265,7 @@ impl Engine {
             if self.st.lock().unwrap().aborted {
                 return Err(None);
             }
-            let ready_timeout = Duration::from_secs(if p.engine == "gemini" { 22 } else { 12 });
+            let ready_timeout = Duration::from_secs(if p.engine == "chatgpt" && self.store.with(|s| s.chatgpt_auto_switch) { 45 } else if p.engine == "gemini" { 22 } else { 12 });
             if let Err(e) = x.ready(ready_timeout) {
                 if self.st.lock().unwrap().aborted {
                     return Err(None);

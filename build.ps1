@@ -89,6 +89,7 @@ sys.exit(subprocess.call(command + args))
     Invoke-BuildTool $zig cc @armhf -shared -fPIC -O2 -s -o (Join-Path $tools 'vqe_tap-armhf.so') station/vqe_tap.c -ldl
     Invoke-BuildTool $zig cc -target aarch64-linux-gnu.2.30 -shared -fPIC -O2 -s -o (Join-Path $tools 'vqe_tap-arm64.so') station/vqe_tap.c -ldl
     Invoke-BuildTool $zig cc @armhf -O2 -s -o (Join-Path $tools 'spotcmd') station/spotcmd.c -ldl
+    Invoke-BuildTool $zig cc -target arm-linux-gnueabihf.2.17 -Os -s -o (Join-Path $tools 'mini1-pcm') station/mini1-pcm.c -ldl
 
     $catalog = Get-Content -LiteralPath 'plugins/index.json' -Encoding UTF8 -Raw | ConvertFrom-Json
     $builds = @()
@@ -138,7 +139,7 @@ sys.exit(subprocess.call(command + args))
         $core = Join-Path $release 'jarvis'
         Copy-Item -LiteralPath $core -Destination (Join-Path $stage 'jarvisd') -Force
         Copy-Item -LiteralPath (Join-Path $release 'jarvis-supervisor') -Destination $stage -Force
-        foreach ($name in 'vqe_tap-armhf.so', 'vqe_tap-arm64.so', 'spotcmd') {
+        foreach ($name in 'vqe_tap-armhf.so', 'vqe_tap-arm64.so', 'spotcmd', 'mini1-pcm') {
             Copy-Item -LiteralPath (Join-Path $tools $name) -Destination $stage -Force
         }
         foreach ($name in 'wake.bin', 'oww.bin', 'wake_oww.bin') {
@@ -148,7 +149,7 @@ sys.exit(subprocess.call(command + args))
             Write-LfFile (Join-Path $stage $name) ([IO.File]::ReadAllText((Join-Path $PSScriptRoot "station/$name")))
         }
         $packageFiles = foreach ($name in 'jarvisd', 'jarvis-supervisor', 'vqe_tap-armhf.so', 'vqe_tap-arm64.so',
-            'spotcmd', 'wake.bin', 'oww.bin', 'wake_oww.bin', 'jarvisd.sh', 'S98jarvisd') {
+            'spotcmd', 'mini1-pcm', 'wake.bin', 'oww.bin', 'wake_oww.bin', 'jarvisd.sh', 'S98jarvisd') {
             Join-Path $stage $name
         }
         Compress-Archive -LiteralPath $packageFiles -DestinationPath (Join-Path $out "station-$arch.zip") -Force

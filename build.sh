@@ -32,6 +32,7 @@ chmod +x "$tools/cc" "$tools/ar"
 "$ZIG" cc -target arm-linux-gnueabihf.2.30 -mcpu=cortex_a7 -shared -fPIC -O2 -s -o "$tools/vqe_tap-armhf.so" station/vqe_tap.c -ldl
 "$ZIG" cc -target aarch64-linux-gnu.2.30 -shared -fPIC -O2 -s -o "$tools/vqe_tap-arm64.so" station/vqe_tap.c -ldl
 "$ZIG" cc -target arm-linux-gnueabihf.2.30 -mcpu=cortex_a7 -O2 -s -o "$tools/spotcmd" station/spotcmd.c -ldl
+"$ZIG" cc -target arm-linux-gnueabihf.2.17 -Os -s -o "$tools/mini1-pcm" station/mini1-pcm.c -ldl
 
 manifest="$out/rust-builds.json"
 printf '{"version":"%s","builds":[' "$VERSION" > "$manifest"
@@ -67,10 +68,10 @@ for arch in ${STATION_ARCHES:-arm64 armv7}; do
     mkdir -p "$stage"
     cp "$release/jarvis" "$stage/jarvisd"
     cp "$release/jarvis-supervisor" "$stage/"
-    cp "$tools"/vqe_tap-*.so "$tools/spotcmd" models/wake.bin models/oww.bin models/wake_oww.bin "$stage/"
+    cp "$tools"/vqe_tap-*.so "$tools/spotcmd" "$tools/mini1-pcm" models/wake.bin models/oww.bin models/wake_oww.bin "$stage/"
     for file in jarvisd.sh S98jarvisd; do tr -d '\r' < "station/$file" > "$stage/$file"; done
     rm -f "$out/station-$arch.zip"
-    (cd "$stage" && zip -q "$out/station-$arch.zip" jarvisd jarvis-supervisor vqe_tap-*.so spotcmd wake.bin oww.bin wake_oww.bin jarvisd.sh S98jarvisd)
+    (cd "$stage" && zip -q "$out/station-$arch.zip" jarvisd jarvis-supervisor vqe_tap-*.so spotcmd mini1-pcm wake.bin oww.bin wake_oww.bin jarvisd.sh S98jarvisd)
     cp "$stage/jarvisd" "$out/jarvisd-$arch"
     core_assets="$core_assets jarvisd-$arch"
     bytes=$(wc -c < "$stage/jarvisd" | tr -d '[:space:]')

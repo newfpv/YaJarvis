@@ -296,7 +296,7 @@ async fn run(f: Flags, store: settings::Store) {
     let (listener, det) = wake::Listener::new(&f.data, &store, host.wake_training());
     let player = {
         let st = store.clone();
-        audio::Player::new(Box::new(move || st.voice_volume()), Box::new(|| speakervol::voice_trim(speakervol::speaker_level())))
+        audio::Player::new(&f.data, Box::new(move || st.voice_volume()), Box::new(|| speakervol::voice_trim(speakervol::speaker_level())))
     };
     let leds = {
         let st = store.clone();

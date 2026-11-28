@@ -45,6 +45,17 @@ pub(crate) fn tls_config(config: &Config) -> Result<Arc<ClientConfig>, String> {
     Ok(Arc::new(tls))
 }
 
+pub(crate) fn sanitize_err(stage: &'static str, err: &io::Error, redact: &[&str]) -> io::Error {
+    let mut msg = err.to_string();
+    for secret in redact {
+        if !secret.is_empty() {
+            msg = msg.replace(secret, "<redacted>");
+        }
+    }
+    let short: String = msg.chars().take(160).collect();
+    io::Error::new(err.kind(), format!("[{stage}] {short}"))
+}
+
 pub(crate) async fn dial(
     config: &Config,
     tls: Arc<ClientConfig>,
@@ -59,13 +70,23 @@ pub(crate) async fn dial_command(
     target: &Target,
     udp: bool,
 ) -> io::Result<BoxIo> {
+    let host = config.host.as_str();
     // Resolve only the VPN server locally. The target's domain is encoded into VLESS unchanged.
-    let socket = TcpStream::connect((config.host.as_str(), config.port)).await?;
-    socket.set_nodelay(true)?;
+    let socket = TcpStream::connect((host, config.port))
+        .await
+        .map_err(|e| sanitize_err("tcp", &e, &[host]))?;
+    socket
+        .set_nodelay(true)
+        .map_err(|e| sanitize_err("tcp", &e, &[host]))?;
     if config.reality.is_some() || config.vision {
-        let session = crate::reality::client(config).map_err(io::Error::other)?;
+        let stage = if config.reality.is_some() { "reality_tls" } else { "tls" };
+        let session = crate::reality::client(config)
+            .map_err(|e| sanitize_err(stage, &io::Error::other(e), &[host]))?;
         let mut stream = crate::tls_io::TlsIo::new(Box::new(socket), session);
-        stream.handshake().await?;
+        stream
+            .handshake()
+            .await
+            .map_err(|e| sanitize_err(stage, &e, &[host]))?;
         let mut header = if udp && config.vision {
             // XUDP uses VLESS command Mux. Its first frame supplies the destination.
             let mut mux = vec![0];
@@ -73,7 +94,9 @@ pub(crate) async fn dial_command(
             mux.extend([0, 3]);
             mux
         } else {
-            target.vless_header_for(&config.uuid, udp)?
+            target
+                .vless_header_for(&config.uuid, udp)
+                .map_err(|e| sanitize_err("vless", &e, &[host]))?
         };
         if config.vision {
             // Addons protobuf: field 1 (flow), using the canonical wire flow for both TCP aliases.
@@ -82,8 +105,14 @@ pub(crate) async fn dial_command(
             addon.extend(flow);
             header.splice(17..18, addon);
         }
-        stream.write_all(&header).await?;
-        stream.flush().await?;
+        stream
+            .write_all(&header)
+            .await
+            .map_err(|e| sanitize_err("vless", &e, &[host]))?;
+        stream
+            .flush()
+            .await
+            .map_err(|e| sanitize_err("vless", &e, &[host]))?;
         return if config.vision {
             Ok(Box::new(crate::vision::VisionIo::new(stream, config.uuid)))
         } else {
@@ -92,20 +121,37 @@ pub(crate) async fn dial_command(
     }
     let mut io: BoxIo = if config.tls {
         let name = ServerName::try_from(config.server_name.clone())
-            .map_err(|_| io::Error::other("invalid VPN SNI"))?;
-        let conn = ClientConnection::new(tls, name).map_err(io::Error::other)?;
+            .map_err(|_| io::Error::other("[tls] invalid VPN SNI"))?;
+        let conn = ClientConnection::new(tls, name)
+            .map_err(|e| sanitize_err("tls", &io::Error::other(e), &[host]))?;
         let mut stream = crate::tls_io::TlsIo::new(Box::new(socket), conn);
-        stream.handshake().await?;
+        stream
+            .handshake()
+            .await
+            .map_err(|e| sanitize_err("tls", &e, &[host]))?;
         Box::new(stream)
     } else {
         Box::new(socket)
     };
     if config.websocket {
-        io = Box::new(crate::websocket::connect(io, config).await?);
+        io = Box::new(
+            crate::websocket::connect(io, config)
+                .await
+                .map_err(|e| sanitize_err("ws", &e, &[host]))?,
+        );
     }
-    let header = if udp { target.vless_header_for(&config.uuid, true)? } else { target.vless_header(&config.uuid)? };
-    io.write_all(&header).await?;
-    io.flush().await?;
+    let header = if udp {
+        target.vless_header_for(&config.uuid, true)
+    } else {
+        target.vless_header(&config.uuid)
+    }
+    .map_err(|e| sanitize_err("vless", &e, &[host]))?;
+    io.write_all(&header)
+        .await
+        .map_err(|e| sanitize_err("vless", &e, &[host]))?;
+    io.flush()
+        .await
+        .map_err(|e| sanitize_err("vless", &e, &[host]))?;
     // Do not await the VLESS response here: some servers send it only after the first payload.
     Ok(Box::new(VlessIo::new(io)))
 }

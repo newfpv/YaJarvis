@@ -178,6 +178,18 @@ async fn serve(
     connections.shutdown().await;
 }
 
+fn log_dial_error(msg: &str) {
+    static LAST_DIAL_ERR: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    let now = std::time::Instant::now();
+    let mut guard = LAST_DIAL_ERR.lock().unwrap();
+    if guard.is_some_and(|t| now.saturating_duration_since(t) < Duration::from_secs(5)) {
+        return;
+    }
+    *guard = Some(now);
+    drop(guard);
+    eprintln!("VPN: {msg}");
+}
+
 async fn connection(
     mut socket: TcpStream,
     config: Arc<Config>,
@@ -198,6 +210,7 @@ async fn connection(
         let upstream = match transport::dial(&config, tls, &target).await {
             Ok(io) => io,
             Err(e) => {
+                log_dial_error(&format!("сбой подключения: {e}"));
                 let _ = protocol::socks_reply(&mut socket, 5).await;
                 return Err(e);
             }
@@ -205,8 +218,13 @@ async fn connection(
         protocol::socks_reply(&mut socket, 0).await?;
         Ok::<_, std::io::Error>(upstream)
     };
-    let Ok(Ok(mut upstream)) = tokio::time::timeout(Duration::from_secs(15), setup).await else {
-        return;
+    let mut upstream = match tokio::time::timeout(Duration::from_secs(15), setup).await {
+        Ok(Ok(io)) => io,
+        Ok(Err(_)) => return,
+        Err(_) => {
+            log_dial_error("таймаут подключения (15 с, setup)");
+            return;
+        }
     };
     let _ = copy_bidirectional(&mut socket, &mut upstream).await;
 }

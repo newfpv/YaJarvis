@@ -364,3 +364,13 @@ async fn connection_limit_counts_incomplete_handshakes_and_stop_closes_them() {
     .await
     .unwrap();
 }
+
+#[test]
+fn stage_errors_include_stage_and_redact_server_host() {
+    let raw = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connect to secret-vpn.example.org:8443 failed");
+    let err = transport::sanitize_err("reality_tls", &raw, &["secret-vpn.example.org"]);
+    let msg = err.to_string();
+    assert!(msg.starts_with("[reality_tls] "));
+    assert!(!msg.contains("secret-vpn.example.org"));
+    assert!(msg.contains("<redacted>"));
+}

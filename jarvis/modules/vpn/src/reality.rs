@@ -117,7 +117,7 @@ impl tls::reality::ClientHooks for Hooks {
             .as_secs();
         let timestamp = u32::try_from(timestamp).map_err(|_| Error::FailedToGetCurrentTime)?;
         let mut plain = Zeroizing::new([0; 16]);
-        plain[..3].copy_from_slice(&[1, 8, 0]);
+        plain[..3].copy_from_slice(&[26, 1, 1]);
         plain[4..8].copy_from_slice(&timestamp.to_be_bytes());
         plain[8..].copy_from_slice(&self.short_id);
         let mut aad = hello.to_vec();
@@ -377,7 +377,7 @@ mod tests {
                 &mut sealed,
             )
             .unwrap();
-        assert_eq!(&plaintext[..4], &[1, 8, 0, 0]);
+        assert_eq!(&plaintext[..4], &[26, 1, 1, 0]);
         assert_eq!(&plaintext[8..], &hex::decode("0123456789abcdef").unwrap());
         let timestamp = u32::from_be_bytes(plaintext[4..8].try_into().unwrap()) as u64;
         assert!(

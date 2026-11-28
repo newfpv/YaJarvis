@@ -108,6 +108,8 @@ struct Speaker {
     problems: Vec<String>,
     #[serde(skip)]
     storage: Storage,
+    #[serde(skip)]
+    mini1_pcm: bool,
 }
 
 #[derive(Default)]
@@ -124,10 +126,13 @@ struct Footprint {
 }
 
 impl Footprint {
-    fn from_files(files: &BTreeMap<&str, u64>, userland: &str, present_models: &[bool; MODELS.len()]) -> Self {
+    fn from_files(files: &BTreeMap<&str, u64>, userland: &str, present_models: &[bool; MODELS.len()], mini1_pcm: bool) -> Self {
         let tap = format!("vqe_tap-{userland}.so");
         let mut result = Self { flash_kib: INSTALL_RESERVE_KIB, temp_kib: INSTALL_RESERVE_KIB };
         for (&name, &bytes) in files {
+            if name == "mini1-pcm" && !mini1_pcm {
+                continue;
+            }
             let kib = bytes.div_ceil(4096) * 4;
             result.temp_kib += kib;
             let kept = MODELS.iter().position(|model| *model == name).is_some_and(|i| present_models[i]);
@@ -142,7 +147,10 @@ impl Footprint {
 
 impl Speaker {
     fn check_space(&mut self, files: &BTreeMap<&str, u64>) -> Result<(), String> {
-        let needed = Footprint::from_files(files, &self.userland, &self.storage.present_models);
+        if self.mini1_pcm && !files.contains_key("mini1-pcm") {
+            return Err("Для этой Мини 1 нужен пакет с проигрывателем mini1-pcm".into());
+        }
+        let needed = Footprint::from_files(files, &self.userland, &self.storage.present_models, self.mini1_pcm);
         self.need_mb = Some(needed.flash_kib.div_ceil(1024));
         let flash_ok = self.storage.flash_kib + self.storage.previous_kib >= needed.flash_kib;
         let temp_ok = self.storage.temp_kib >= needed.temp_kib;
@@ -381,11 +389,15 @@ impl Setup {
             return Err("Нужен IP вашей колонки в домашней сети".into());
         }
         self.adb(&["connect", &target.to_string()], 10).await?;
-        let info = self.shell(target, r#"id -u; uname -m; head -c 160 /proc/device-tree/model 2>/dev/null | tr -d '\000\n'; printf '\n'; df -k /data 2>/dev/null | awk 'END{print $4}'; awk '/MemTotal/{print $2}' /proc/meminfo; { od -An -tu1 -N20 /system/vendor/quasar/maind 2>/dev/null || hexdump -v -n 20 -e '1/1 "%u "' /system/vendor/quasar/maind 2>/dev/null; } | tr '\n' ' '; printf '\n'; m=""; test -d /etc/init.d || m="${m}init.d,"; command -v aplay >/dev/null || m="${m}aplay,"; command -v start-stop-daemon >/dev/null || m="${m}start-stop-daemon,"; if [ -z "$m" ]; then echo ready; else echo "missing:${m%,}"; fi
+        let info = self.shell(target, r#"id -u; uname -m; head -c 160 /proc/device-tree/model 2>/dev/null | tr -d '\000\n'; printf '\n'; df -k /data 2>/dev/null | awk 'END{print $4}'; awk '/MemTotal/{print $2}' /proc/meminfo; { od -An -tu1 -N20 /system/vendor/quasar/maind 2>/dev/null || hexdump -v -n 20 -e '1/1 "%u "' /system/vendor/quasar/maind 2>/dev/null; } | tr '\n' ' '; printf '\n'; m=""; test -d /etc/init.d || m="${m}init.d,"; command -v start-stop-daemon >/dev/null || m="${m}start-stop-daemon,"; if [ -z "$m" ]; then echo ready; else echo "missing:${m%,}"; fi
 d=/data/opt/jarvisd
 if [ -f "$d/jarvisd.prev-rust" ]; then du -k "$d/jarvisd.prev-rust" 2>/dev/null | awk '{print $1}'; else echo 0; fi
 df -k /tmp 2>/dev/null | awk 'END{print $4}'
-for model in wake.bin oww.bin wake_oww.bin; do if [ -e "$d/$model" ]; then echo 1; else echo 0; fi; done"#).await?;
+for model in wake.bin oww.bin wake_oww.bin; do if [ -e "$d/$model" ]; then echo 1; else echo 0; fi; done
+if command -v aplay >/dev/null; then echo aplay; else echo missing; fi
+if [ -r /lib/ld-linux-armhf.so.3 ] && [ -r /system/vendor/quasar/libs/libasound.so.2 ]; then
+    tr -d '\000' 2>/dev/null </proc/device-tree/amlogic-dt-id || true
+fi"#).await?;
         let fields: Vec<_> = info.lines().collect();
         let field = |i: usize| fields.get(i).map_or("", |s| s.trim());
         let root = field(0) == "0";
@@ -412,6 +424,7 @@ for model in wake.bin oww.bin wake_oww.bin; do if [ -e "$d/$model" ]; then echo 
             userland: userland.into(),
             installed,
             root,
+            mini1_pcm: userland == "armhf" && field(13) == "axg_s420_v03",
             free_mb: free_kb / 1024,
             staging_mb: (free_kb + rollback_kb) / 1024,
             ram_mb: field(4).parse::<u64>().unwrap_or(0) / 1024,
@@ -433,6 +446,9 @@ for model in wake.bin oww.bin wake_oww.bin; do if [ -e "$d/$model" ]; then echo 
         }
         sp.problems
             .extend(detect_compat_problems(field(1), arch, userland, field(6), &profile));
+        if field(12) != "aplay" && !sp.mini1_pcm {
+            sp.problems.push("На колонке не найден проигрыватель aplay".into());
+        }
         if sp.problems.is_empty()
             && let Some(dir) = payload_dir().0
             && let Ok(file) = std::fs::File::open(dir.join(format!("station-{}.zip", sp.arch)))
@@ -921,8 +937,8 @@ mod payload_tests {
             ("jarvisd.sh", 2_750),
             ("S98jarvisd", 355),
         ]);
-        let clean = Footprint::from_files(&files, "armhf", &[false; 3]);
-        let update = Footprint::from_files(&files, "armhf", &[true; 3]);
+        let clean = Footprint::from_files(&files, "armhf", &[false; 3], false);
+        let update = Footprint::from_files(&files, "armhf", &[true; 3], false);
         assert_eq!(clean.flash_kib.div_ceil(1024), 10);
         assert_eq!(update.flash_kib.div_ceil(1024), 8);
         assert_eq!(clean.temp_kib, update.temp_kib);
@@ -934,6 +950,13 @@ mod payload_tests {
         assert!(speaker.check_space(&files).unwrap_err().contains("/tmp"));
         speaker.storage.temp_kib = clean.temp_kib;
         assert!(speaker.check_space(&files).is_ok());
+        speaker.mini1_pcm = true;
+        assert!(speaker.check_space(&files).unwrap_err().contains("mini1-pcm"));
+        let mut files = files;
+        files.insert("mini1-pcm", 1024);
+        speaker.storage.flash_kib += 4;
+        speaker.storage.temp_kib += 4;
+        assert!(speaker.check_space(&files).is_ok());
     }
 }
 
@@ -942,10 +965,10 @@ fn package_entries<R: Read + Seek>(
     mut visit: impl FnMut(&'static str, zip::read::ZipFile<'_, R>) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut zip = zip::ZipArchive::new(reader).map_err(|e| e.to_string())?;
-    for name in REQUIRED.iter().copied().chain(std::iter::once("spotcmd")) {
+    for name in REQUIRED.iter().copied().chain(["spotcmd", "mini1-pcm"]) {
         let entry = match zip.by_name(name) {
             Ok(e) => e,
-            Err(zip::result::ZipError::FileNotFound) if name == "spotcmd" => continue,
+            Err(zip::result::ZipError::FileNotFound) if matches!(name, "spotcmd" | "mini1-pcm") => continue,
             Err(_) => return Err(format!("В пакете отсутствует {name}")),
         };
         if !entry.is_file() || entry.is_symlink() || entry.size() > jarvis_station::MAX_BINARY {
@@ -1163,6 +1186,9 @@ async fn stage_install(
 ) -> Result<String, String> {
     let target = input.adb_address;
     for (name, digest) in sums {
+        if name == "mini1-pcm" && !sp.mini1_pcm {
+            continue;
+        }
         app.log(&format!("Копирую {name}"));
         app.push(target, &temp.join(name), &format!("{stage}/{name}"))
             .await?;
@@ -1425,6 +1451,11 @@ if [ "$new_tap" != "$old_tap" ]; then
     cp "$s/vqe_tap-{userland}.so" "$d/vqe_tap.so.new"
 fi
 if [ -f "$s/spotcmd" ]; then cp "$s/spotcmd" "$d/spotcmd"; chmod 755 "$d/spotcmd"; fi
+if [ -f "$s/mini1-pcm" ]; then
+    cp "$s/mini1-pcm" "$d/mini1-pcm.new"
+    chmod 755 "$d/mini1-pcm.new"
+    mv -f "$d/mini1-pcm.new" "$d/mini1-pcm"
+fi
 init=/etc/init.d/S98jarvisd
 manual=0
 if [ ! -f "$init" ]; then
@@ -1518,10 +1549,10 @@ fn detect_compat_problems(
     if sys_check != "ready" {
         match sys_check.strip_prefix("missing:").filter(|s| !s.is_empty()) {
             Some(missing) => problems.push(format!(
-                "На колонке не найдены системные компоненты Linux: {missing} (нужны /etc/init.d, aplay и start-stop-daemon)"
+                "На колонке не найдены системные компоненты Linux: {missing} (нужны /etc/init.d и start-stop-daemon)"
             )),
             None => problems.push(
-                "На колонке не подтверждены системные компоненты Linux (/etc/init.d, aplay, start-stop-daemon)".into(),
+                "На колонке не подтверждены системные компоненты Linux (/etc/init.d, start-stop-daemon)".into(),
             ),
         }
     }

@@ -506,8 +506,11 @@ impl Engine {
         if cancelled() {
             return Err(INTERRUPTED.into());
         }
-        self.player.finish(Duration::from_secs(2));
-        Ok(())
+        let result = self.player.finish_checked(Duration::from_secs(2));
+        if cancelled() {
+            return Err(INTERRUPTED.into());
+        }
+        result.map_err(|e| format!("Не удалось воспроизвести образец: {e}"))
     }
 }
 

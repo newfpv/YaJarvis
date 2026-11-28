@@ -4,7 +4,7 @@
 use jarvis_dsp::audio::{Limiter, OUT_RATE, Upsampler, gain_pcm};
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
         Arc, Mutex,
@@ -131,7 +131,7 @@ const PLAY_GAIN: f64 = 6.5;
 struct Playing {
     child: Child,
     queue: Option<SyncSender<Vec<u8>>>,
-    pump: Option<thread::JoinHandle<()>>,
+    pump: thread::JoinHandle<std::io::Result<()>>,
     lim: Limiter,
     up: Option<Upsampler>,
     boost: f64,
@@ -139,10 +139,10 @@ struct Playing {
     up_buf: Vec<i16>,
 }
 
-/// Плеер: один ответ = один процесс aplay. Стоп — SIGINT: aplay сам корректно отцепляется от dmix.
+/// Плеер: один ответ = один процесс вывода. Стоп — SIGINT: aplay сам корректно отцепляется от dmix.
 pub struct Player {
     cur: Mutex<Option<Playing>>,
-    aplay: String,
+    mini1_pcm: Option<PathBuf>,
     /// 0..100, читается на каждом куске.
     pub volume: Box<dyn Fn() -> i64 + Send + Sync>,
     /// Поправка к громкости голоса от громкости самой колонки (1 — без поправки).
@@ -150,9 +150,10 @@ pub struct Player {
 }
 
 impl Player {
-    pub fn new(volume: Box<dyn Fn() -> i64 + Send + Sync>, trim: Box<dyn Fn() -> f64 + Send + Sync>) -> Arc<Player> {
-        let aplay = if std::path::Path::new("/usr/bin/aplay").exists() { "/usr/bin/aplay" } else { "aplay" };
-        Arc::new(Player { cur: Mutex::default(), aplay: aplay.into(), volume, trim })
+    pub fn new(data: &Path, volume: Box<dyn Fn() -> i64 + Send + Sync>, trim: Box<dyn Fn() -> f64 + Send + Sync>) -> Arc<Player> {
+        let helper = data.join("mini1-pcm");
+        let mini1_pcm = helper.is_file().then_some(helper);
+        Arc::new(Player { cur: Mutex::default(), mini1_pcm, volume, trim })
     }
 
     pub fn playing(&self) -> bool {
@@ -163,8 +164,16 @@ impl Player {
     pub fn start(&self, rate: usize) -> std::io::Result<()> {
         self.stop(true);
         let (up, out) = if rate > 0 && rate < OUT_RATE && OUT_RATE % rate == 0 { (Some(Upsampler::new(OUT_RATE / rate)), OUT_RATE) } else { (None, rate) };
-        let mut child = Command::new(&self.aplay)
-            .args(["-q", "-D", "default", "-t", "raw", "-f", "S16_LE", "-r", &out.to_string(), "-c", "1"])
+        let mut cmd = if let Some(helper) = &self.mini1_pcm {
+            let mut cmd = Command::new(helper);
+            cmd.env("LD_LIBRARY_PATH", "/system/vendor/quasar/libs").arg(out.to_string());
+            cmd
+        } else {
+            let mut cmd = Command::new(if Path::new("/usr/bin/aplay").exists() { "/usr/bin/aplay" } else { "aplay" });
+            cmd.args(["-q", "-D", "default", "-t", "raw", "-f", "S16_LE", "-r", &out.to_string(), "-c", "1"]);
+            cmd
+        };
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -172,7 +181,7 @@ impl Player {
         let stdin = child.stdin.take().unwrap();
         let (tx, rx) = sync_channel::<Vec<u8>>(512);
         let pump = thread::Builder::new().name("aplay-pump".into()).stack_size(128 * 1024).spawn(move || pump(stdin, rx))?;
-        *self.cur.lock().unwrap() = Some(Playing { child, queue: Some(tx), pump: Some(pump), lim: Limiter::new(rate), up, boost: 1.0, shaped: Vec::new(), up_buf: Vec::new() });
+        *self.cur.lock().unwrap() = Some(Playing { child, queue: Some(tx), pump, lim: Limiter::new(rate), up, boost: 1.0, shaped: Vec::new(), up_buf: Vec::new() });
         Ok(())
     }
 
@@ -214,15 +223,31 @@ impl Player {
 
     /// Доиграть то, что уже отдано, и закрыть.
     pub fn finish(&self, timeout: Duration) {
-        let Some(mut p) = self.cur.lock().unwrap().take() else { return };
-        p.queue.take(); // закрыть очередь: насос допишет и закроет stdin
-        let t0 = Instant::now();
-        if let Some(h) = p.pump.take() {
-            while !h.is_finished() && t0.elapsed() < timeout {
-                thread::sleep(Duration::from_millis(20));
-            }
+        if let Err(e) = self.finish_checked(timeout)
+            && e.kind() != std::io::ErrorKind::Interrupted
+        {
+            log::warn!("динамик: {e}");
         }
-        wait_child(&mut p.child, timeout.saturating_sub(t0.elapsed()).max(Duration::from_millis(200)));
+    }
+
+    pub fn finish_checked(&self, timeout: Duration) -> std::io::Result<()> {
+        let Some(mut p) = self.cur.lock().unwrap().take() else {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "воспроизведение уже остановлено"));
+        };
+        p.queue.take();
+        let start = Instant::now();
+        let pump = p.pump;
+        while !pump.is_finished() && start.elapsed() < timeout {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let status = wait_child(&mut p.child, timeout.saturating_sub(start.elapsed()).max(Duration::from_millis(200)))?;
+        if !status.success() {
+            return Err(std::io::Error::other(format!("проигрыватель завершился ({status})")));
+        }
+        if !pump.is_finished() {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "очередь звука не опустела вовремя"));
+        }
+        pump.join().map_err(|_| std::io::Error::other("поток вывода завершился аварийно"))?
     }
 
     /// Оборвать сразу (now) или дать доиграть буфер ALSA.
@@ -232,18 +257,16 @@ impl Player {
         if now {
             interrupt(&p.child);
         }
-        wait_child(&mut p.child, Duration::from_secs(2));
+        let _ = wait_child(&mut p.child, Duration::from_secs(2));
     }
 }
 
-fn pump(mut stdin: ChildStdin, rx: Receiver<Vec<u8>>) {
+fn pump(mut stdin: ChildStdin, rx: Receiver<Vec<u8>>) -> std::io::Result<()> {
     use std::io::Write;
     for b in rx {
-        if let Err(e) = stdin.write_all(&b) {
-            log::warn!("динамик (aplay): ошибка записи ({e})");
-            return; // плеер умер — остаток выбрасываем (rx закроется вместе с потоком)
-        }
+        stdin.write_all(&b)?;
     }
+    Ok(())
 }
 
 fn log_aplay_exit(child: &mut Child, status: std::process::ExitStatus) {
@@ -274,23 +297,23 @@ fn interrupt(child: &Child) {
     let _ = child;
 }
 
-fn wait_child(child: &mut Child, timeout: Duration) {
+fn wait_child(child: &mut Child, timeout: Duration) -> std::io::Result<std::process::ExitStatus> {
     let t0 = Instant::now();
     loop {
-        if let Ok(Some(status)) = child.try_wait() {
+        if let Some(status) = child.try_wait()? {
             log_aplay_exit(child, status);
-            return;
+            return Ok(status);
         }
         if t0.elapsed() > timeout {
             interrupt(child);
             thread::sleep(Duration::from_secs(1));
-            if let Ok(Some(status)) = child.try_wait() {
+            if let Some(status) = child.try_wait()? {
                 log_aplay_exit(child, status);
             } else {
                 let _ = child.kill();
                 let _ = child.wait();
             }
-            return;
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "проигрыватель не завершился вовремя"));
         }
         thread::sleep(Duration::from_millis(20));
     }
@@ -351,6 +374,29 @@ pub(crate) fn classify_platformd_maps(maps: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{classify_platformd_maps, why_from_state};
+
+    #[cfg(unix)]
+    #[test]
+    fn preview_drain_checks_the_player_exit_even_after_accepting_all_pcm() {
+        use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
+        let dir = std::env::temp_dir().join(format!("jarvis-pcm-{}", crate::settings::rand_hex(6)));
+        fs::create_dir(&dir).unwrap();
+        let helper = dir.join("mini1-pcm");
+        for code in [0, 1] {
+            fs::write(&helper, format!("#!/bin/sh\n[ \"$1\" = 48000 ] || exit 2\ncat >/dev/null\nexit {code}\n")).unwrap();
+            fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+            let player = super::Player::new(&dir, Box::new(|| 50), Box::new(|| 1.0));
+            player.start(24000).unwrap();
+            player.write(&[1000; 480]).unwrap();
+            let result = player.finish_checked(Duration::from_secs(2));
+            if code == 0 {
+                result.unwrap();
+            } else {
+                assert!(result.unwrap_err().to_string().contains("exit status: 1"));
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn detects_vqe_tap_state_in_proc_maps() {

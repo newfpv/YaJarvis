@@ -1976,7 +1976,7 @@ mod tests {
         let host = super::Host::new(dir.clone(), crate::plugins::Hooks::default());
         let proxy = crate::vpn::Proxy::new(store.clone());
         let mic = super::Mic::new(dir.join("mic.sock"), Box::new(|| 0));
-        let player = super::Player::new(Box::new(|| 40), Box::new(|| 1.0));
+        let player = super::Player::new(&dir, Box::new(|| 40), Box::new(|| 1.0));
         let leds = super::Leds::new(Box::new(crate::settings::default_led));
         let journal = std::sync::Arc::new(super::Journal::default());
         let tools = std::sync::Arc::new(super::Tools::new(host.clone(), store.clone()));
@@ -2285,7 +2285,7 @@ mod tests {
         let host = super::Host::new(dir.clone(), crate::plugins::Hooks::default());
         let proxy = crate::vpn::Proxy::new(store.clone());
         let mic = super::Mic::new(dir.join("mic.sock"), Box::new(|| 0));
-        let player = super::Player::new(Box::new(|| 40), Box::new(|| 1.0));
+        let player = super::Player::new(&dir, Box::new(|| 40), Box::new(|| 1.0));
         let leds = super::Leds::new(Box::new(crate::settings::default_led));
         let journal = std::sync::Arc::new(super::Journal::default());
         let tools = std::sync::Arc::new(super::Tools::new(host.clone(), store.clone()));

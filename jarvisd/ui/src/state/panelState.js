@@ -46,6 +46,10 @@ export async function readJournal(signal) {
   S.speaker.phase = data.phase || "";
   if (data.volume >= 0) S.speaker.volume = data.volume;
   S.sys = data.sys || {};
+  if (data.active && S.active !== data.active) {
+    S.active = data.active;
+    speaker.set({ ...S });
+  }
   return true;
 }
 

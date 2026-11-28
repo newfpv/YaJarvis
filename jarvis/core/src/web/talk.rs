@@ -89,6 +89,6 @@ pub async fn journal(State(app): State<App>) -> Response {
     reply(
         StatusCode::OK,
         json!({"items": e.journal.items(50), "mic": e.mic.online(), "mic_why": e.mic.why(), "talking": talking, "phase": phase,
-               "sys": sys, "volume": vol, "version": crate::version()}),
+               "active": app.store.with(|s| s.active.clone()), "sys": sys, "volume": vol, "version": crate::version()}),
     )
 }

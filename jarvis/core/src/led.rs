@@ -440,6 +440,23 @@ impl Leds {
     pub fn set(&self, mode: Mode) {
         self.inner.set_inner(mode, false)
     }
+
+    pub fn keep_alive(&self) {
+        let activate = {
+            let mut st = self.inner.st.lock().unwrap();
+            match st.mode {
+                Mode::Listening => {
+                    st.until = Some(Instant::now() + Duration::from_secs(20));
+                    false
+                }
+                Mode::Off => !st.off && st.available(),
+                Mode::Thinking | Mode::Speaking => false,
+            }
+        };
+        if activate {
+            self.set(Mode::Listening);
+        }
+    }
 }
 
 impl Inner {
@@ -578,6 +595,63 @@ mod tests {
         assert_eq!(std::fs::read_to_string(trig_led.join("brightness")).unwrap(), "0");
         assert_eq!(std::fs::read_to_string(trig_led.join("trigger")).unwrap(), "ledfb-logo");
         assert_eq!(std::fs::read_to_string(plain_led.join("brightness")).unwrap(), "12");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn keep_alive_extends_listening_until_and_respects_disabled_setting() {
+        let dir = std::env::temp_dir().join(format!("jarvis-led-ka-{}", crate::settings::rand_hex(6)));
+        let led_dir = dir.join("mini2_blue_ring1");
+        std::fs::create_dir_all(&led_dir).unwrap();
+        std::fs::write(led_dir.join("brightness"), "0").unwrap();
+        std::fs::write(led_dir.join("trigger"), "[none] timer").unwrap();
+
+        let now = Instant::now();
+        let leds = Leds {
+            inner: Arc::new(Inner {
+                st: Mutex::new(St {
+                    palette: default_palette(),
+                    off: false,
+                    stopped: false,
+                    chans: vec![Chan {
+                        path: led_dir.join("brightness"),
+                        color: "blue".into(),
+                        color_idx: 2,
+                        max: 255,
+                        group: 0,
+                        last: -1,
+                        trig: String::new(),
+                    }],
+                    clock: vec![],
+                    saved: HashMap::new(),
+                    mode: Mode::Off,
+                    until: None,
+                    groups: 1,
+                    since: now,
+                    level: 0.0,
+                    target: 0.0,
+                    hear: 0.0,
+                    hear_t: 0.0,
+                    frames: 0,
+                    lvl_at: now,
+                    phase: Mode::Off,
+                }),
+                wake: Condvar::new(),
+                source: Box::new(crate::settings::default_led),
+            }),
+        };
+
+        leds.set(Mode::Listening);
+        let expired = Instant::now() - Duration::from_secs(1);
+        leds.inner.st.lock().unwrap().until = Some(expired);
+        leds.keep_alive();
+        let renewed = leds.inner.st.lock().unwrap().until.unwrap();
+        assert!(renewed > expired + Duration::from_secs(10));
+
+        leds.set(Mode::Off);
+        leds.inner.st.lock().unwrap().off = true;
+        leds.keep_alive();
+        assert_eq!(leds.phase(), Mode::Off);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

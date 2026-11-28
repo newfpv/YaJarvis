@@ -54,6 +54,26 @@ struct St {
 const ECHO_TAIL: Duration = Duration::from_millis(450);
 const WAKE_INTERRUPT_AEC_GRACE: Duration = Duration::from_millis(550);
 const WAKE_INTERRUPT_MIN_PROB: f32 = 0.88;
+const MAX_SILENT_SESSION: Duration = Duration::from_secs(45);
+const MAX_UNANSWERED_WAKE: Duration = Duration::from_secs(15);
+
+fn session_stuck_silent(
+    by_word: bool,
+    answered: bool,
+    speaking: bool,
+    delegations: i32,
+    user_turns: usize,
+    since_ready: Duration,
+    since_last_voice: Option<Duration>,
+) -> bool {
+    if speaking || delegations > 0 {
+        return false;
+    }
+    if by_word && !answered && user_turns == 0 && since_ready >= MAX_UNANSWERED_WAKE {
+        return true;
+    }
+    since_last_voice.unwrap_or(since_ready) >= MAX_SILENT_SESSION
+}
 
 /// Перебивать ответ словом активации только когда колонка реально говорит, после окна сходимости VQE AEC
 /// на начале фразы и с повышенным порогом уверенности (чтобы остаточное эхо первого слова не обрывало ответ).
@@ -702,6 +722,13 @@ impl Engine {
                             ) {
                                 det.reset();
                                 e.interrupt(&live, wake_prob);
+                            } else if !e.player.playing() && !recent && wake_prob >= WAKE_INTERRUPT_MIN_PROB {
+                                det.reset();
+                                live.dialog().unmute();
+                                live.dialog().touch();
+                                e.leds.set(Mode::Listening);
+                                e.leds.keep_alive();
+                                log::info!("Джарвис: повторное слово в тихой сессии (уверенность {wake_prob:.2}) — слушаю");
                             }
                         }
                         continue;
@@ -1428,6 +1455,24 @@ impl Engine {
                 st.aborted || !st.live.as_ref().is_some_and(|l| same(l, &x))
             };
             if stopped {
+                self.player.stop(true);
+                x.dialog().finish_turn("");
+                close(&sess);
+                return None;
+            }
+            if !speaking {
+                self.leds.keep_alive();
+            }
+            if session_stuck_silent(
+                by_word,
+                answered,
+                speaking,
+                x.dialog().delegations(),
+                x.dialog().user_turns(),
+                ready_at.elapsed(),
+                last_voice.map(|t| t.elapsed()),
+            ) {
+                log::info!("разговор: нет ответа модели — закрываю сессию");
                 self.player.stop(true);
                 x.dialog().finish_turn("");
                 close(&sess);
@@ -2318,5 +2363,18 @@ mod tests {
         engine.clear_say_leds(true);
         assert_eq!(leds.phase(), super::Mode::Listening);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn session_stuck_silent_closes_unanswered_and_silent_runs_unless_busy() {
+        let s = std::time::Duration::from_secs;
+        // Ложное пробуждение с фоновым шумом, модель не ответила за 15 с — закрываем.
+        assert!(!super::session_stuck_silent(true, false, false, 0, 0, s(14), None));
+        assert!(super::session_stuck_silent(true, false, false, 0, 0, s(15), None));
+        // Долгая сессия без ответа модели (>45 с) при работающих делегациях не рвётся, а без них закрывается.
+        assert!(!super::session_stuck_silent(true, true, false, 1, 2, s(60), Some(s(50))));
+        assert!(!super::session_stuck_silent(true, true, true, 0, 2, s(60), Some(s(50))));
+        assert!(!super::session_stuck_silent(true, true, false, 0, 2, s(60), Some(s(44))));
+        assert!(super::session_stuck_silent(true, true, false, 0, 2, s(60), Some(s(45))));
     }
 }

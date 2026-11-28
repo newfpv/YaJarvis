@@ -216,6 +216,10 @@ impl Dialog {
         st.last_activity = Some(Instant::now());
     }
 
+    pub fn delegations(&self) -> i32 {
+        self.st.lock().unwrap().delegations
+    }
+
     /// Текущая реплика человека: id, текст и сколько прошло с последнего кусочка расшифровки.
     pub fn utterance(&self) -> (i64, String, Duration) {
         let st = self.st.lock().unwrap();

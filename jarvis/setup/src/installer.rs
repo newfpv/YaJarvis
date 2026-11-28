@@ -389,7 +389,7 @@ impl Setup {
             return Err("Нужен IP вашей колонки в домашней сети".into());
         }
         self.adb(&["connect", &target.to_string()], 10).await?;
-        let info = self.shell(target, r#"id -u; uname -m; head -c 160 /proc/device-tree/model 2>/dev/null | tr -d '\000\n'; printf '\n'; df -k /data 2>/dev/null | awk 'END{print $4}'; awk '/MemTotal/{print $2}' /proc/meminfo; { od -An -tu1 -N20 /system/vendor/quasar/maind 2>/dev/null || hexdump -v -n 20 -e '1/1 "%u "' /system/vendor/quasar/maind 2>/dev/null; } | tr '\n' ' '; printf '\n'; m=""; test -d /etc/init.d || m="${m}init.d,"; command -v start-stop-daemon >/dev/null || m="${m}start-stop-daemon,"; if [ -z "$m" ]; then echo ready; else echo "missing:${m%,}"; fi
+        let info = self.shell(target, r#"PATH="/usr/sbin:/usr/bin:/sbin:/bin:$PATH"; export PATH; id -u; uname -m; head -c 160 /proc/device-tree/model 2>/dev/null | tr -d '\000\n'; printf '\n'; df -k /data 2>/dev/null | awk 'END{print $4}'; awk '/MemTotal/{print $2}' /proc/meminfo; b=$({ dd if=/system/vendor/quasar/maind bs=1 count=20 2>/dev/null | od -An -tu1 2>/dev/null || od -An -tu1 -N20 /system/vendor/quasar/maind 2>/dev/null || hexdump -v -n 20 -e '1/1 "%u "' /system/vendor/quasar/maind 2>/dev/null || dd if=/system/vendor/quasar/maind bs=1 count=20 2>/dev/null | od -t u1 2>/dev/null; } | tr '\n' ' '); if [ -z "$(printf '%s' "$b" | tr -d ' \t')" ] && [ -f /system/vendor/quasar/maind ]; then if [ -r /lib/ld-linux-aarch64.so.1 ] && [ ! -r /lib/ld-linux-armhf.so.3 ]; then b=elf_arm64; elif [ -r /lib/ld-linux-armhf.so.3 ] && [ ! -r /lib/ld-linux-aarch64.so.1 ]; then b=elf_armhf; fi; fi; printf '%s\n' "$b"; m=""; test -d /etc/init.d || m="${m}init.d,"; command -v start-stop-daemon >/dev/null || m="${m}start-stop-daemon,"; if [ -z "$m" ]; then echo ready; else echo "missing:${m%,}"; fi
 d=/data/opt/jarvisd
 if [ -f "$d/jarvisd.prev-rust" ]; then du -k "$d/jarvisd.prev-rust" 2>/dev/null | awk '{print $1}'; else echo 0; fi
 df -k /tmp 2>/dev/null | awk 'END{print $4}'
@@ -1509,12 +1509,24 @@ fi"#
 }
 
 fn parse_elf_userland(raw: &str) -> &'static str {
-    let bytes: Vec<_> = raw
+    let trimmed = raw.trim();
+    if trimmed == "elf_armhf" {
+        return "armhf";
+    }
+    if trimmed == "elf_arm64" {
+        return "arm64";
+    }
+    // POSIX `od -t u1` prints octal offsets like `0000000` before decimal bytes; skip tokens > 3 chars.
+    let bytes: Vec<u8> = trimmed
         .split_whitespace()
-        .map_while(|n| n.parse::<u8>().ok())
+        .filter(|t| t.len() <= 3 && t.bytes().all(|b| b.is_ascii_digit()))
+        .filter_map(|n| n.parse::<u8>().ok())
         .collect();
-    if bytes.len() >= 20 && &bytes[..4] == b"\x7fELF" && bytes[5] == 1 {
-        match (bytes[4], u16::from_le_bytes([bytes[18], bytes[19]])) {
+    if let Some(pos) = bytes.windows(4).position(|w| w == b"\x7fELF")
+        && let Some(hdr) = bytes.get(pos..pos + 20)
+        && hdr[5] == 1
+    {
+        match (hdr[4], u16::from_le_bytes([hdr[18], hdr[19]])) {
             (1, 40) => "armhf",
             (2, 183) => "arm64",
             _ => "",
@@ -1593,9 +1605,17 @@ mod mic_and_script_tests {
     fn parse_elf_userland_handles_valid_and_invalid_headers() {
         let armhf = "127 69 76 70 1 1 1 0 0 0 0 0 0 0 0 0 3 0 40 0";
         let arm64 = "127 69 76 70 2 1 1 0 0 0 0 0 0 0 0 0 3 0 183 0";
+        let od_armhf = "0000000 127 69 76 70 1 1 1 0 0 0 0 0 0 0 0 0 0000020 3 0 40 0";
+        let od_arm64 = "0000000 127 69 76 70 2 1 1 0 0 0 0 0 0 0 0 0 0000020 3 0 183 0";
+        let od_script = "0000000 35 33 47 98 105 110 47 115 104 10";
         let script = "35 33 47 98 105 110 47 115 104 10";
         assert_eq!(parse_elf_userland(armhf), "armhf");
         assert_eq!(parse_elf_userland(arm64), "arm64");
+        assert_eq!(parse_elf_userland(od_armhf), "armhf");
+        assert_eq!(parse_elf_userland(od_arm64), "arm64");
+        assert_eq!(parse_elf_userland("elf_armhf"), "armhf");
+        assert_eq!(parse_elf_userland("elf_arm64"), "arm64");
+        assert_eq!(parse_elf_userland(od_script), "");
         assert_eq!(parse_elf_userland(script), "");
         assert_eq!(parse_elf_userland(""), "");
     }
